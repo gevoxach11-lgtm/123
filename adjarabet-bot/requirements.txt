@@ -1,0 +1,16 @@
+# AdjaraPoker Bot dependencies
+# Python 3.11+
+
+playwright>=1.44.0
+streamlit>=1.35.0
+loguru>=0.7.2
+python-dotenv>=1.0.1
+pandas>=2.2.0
+plotly>=5.22.0
+pillow>=10.3.0
+opencv-python>=4.9.0.80
+
+# Note: `asyncio` is part of the Python standard library since 3.4 and does
+# not need to be installed via pip. It is listed here only for documentation
+# of the tech stack. Installing the legacy PyPI `asyncio` backport on modern
+# Python can break things, so it is intentionally NOT a hard dependency.
