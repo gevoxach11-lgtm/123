@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 
@@ -210,6 +211,11 @@ class SessionStats:
     big_blind: float = 0.10
     vpip_count: int = 0               # hands where hero voluntarily put $ in pot
     pfr_count: int = 0                # hands where hero raised preflop
+
+    def __post_init__(self) -> None:
+        # Accept a datetime for convenience; store as epoch seconds internally.
+        if isinstance(self.session_start, datetime):
+            self.session_start = self.session_start.timestamp()
 
     # --- Derived metrics ---
     @property

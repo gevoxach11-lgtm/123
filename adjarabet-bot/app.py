@@ -23,7 +23,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import config
-from bot.session import SessionConfig, SessionManager
+from bot.session import SessionConfig, SessionManager, prepare_session
 from poker.models import Card
 from poker.montecarlo import estimate_equity
 from poker.evaluator import describe
@@ -43,32 +43,58 @@ st.set_page_config(
 # Background session runner
 # --------------------------------------------------------------------------- #
 class SessionRunner:
-    """Run a :class:`SessionManager` in a dedicated thread + event loop."""
+    """Own the browser + :class:`SessionManager` in a dedicated thread/loop."""
 
     def __init__(self) -> None:
         self.manager: SessionManager | None = None
+        self.browser = None
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.error: str | None = None
+        self.stop_requested = False
 
     def start(self, cfg: SessionConfig) -> None:
         if self.thread and self.thread.is_alive():
             return
-        self.manager = SessionManager(cfg)
+        self.manager = None
+        self.browser = None
+        self.error = None
+        self.stop_requested = False
 
         def _run() -> None:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             try:
-                self.loop.run_until_complete(self.manager.run())
+                self.loop.run_until_complete(self._session(cfg))
+            except Exception as exc:  # pragma: no cover - surfaced in UI
+                self.error = f"{type(exc).__name__}: {exc}"
             finally:
                 self.loop.close()
 
         self.thread = threading.Thread(target=_run, daemon=True, name="bot-session")
         self.thread.start()
 
+    async def _session(self, cfg: SessionConfig) -> None:
+        try:
+            self.manager, self.browser = await prepare_session(config, cfg)
+            if self.stop_requested:  # stop pressed during setup
+                return
+            await self.manager.start()
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            if self.manager:
+                self.manager.error = self.error
+        finally:
+            if self.browser is not None:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+
     def stop(self) -> None:
+        self.stop_requested = True
         if self.manager:
-            self.manager.stop()
+            self.manager.running = False
 
     @property
     def is_running(self) -> bool:
@@ -152,7 +178,12 @@ def render_status() -> None:
     manager = runner.manager
 
     if not manager:
-        st.info("No session yet. Configure options in the sidebar and press **Start**.")
+        if runner.error:
+            st.error(f"Could not start session: {runner.error}")
+        elif runner.is_running:
+            st.info("Connecting: launching browser, logging in and joining a table...")
+        else:
+            st.info("No session yet. Configure options in the sidebar and press **Start**.")
         return
 
     status = manager.status()
