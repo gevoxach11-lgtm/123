@@ -114,7 +114,7 @@ class SessionManager:
         """Poll the table and act when it's hero's turn."""
         scraper = TableScraper(page, config)
         engine = PokerEngine(config)
-        executor = ActionExecutor(page, dry_run=self.cfg.dry_run or not self.cfg.auto_play)
+        executor = ActionExecutor(page, config, dry_run=self.cfg.dry_run or not self.cfg.auto_play)
 
         poll = config.TIMING["POLL_INTERVAL"]
         logger.info("Entering play loop (poll={}s)", poll)
