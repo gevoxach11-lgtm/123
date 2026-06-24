@@ -53,10 +53,13 @@ adjarabet-bot/
 ## Usage
 
 1. Start the dashboard: `streamlit run app.py`
-2. Enter credentials and table settings in the sidebar
-3. Click **Start** — the bot logs in, joins a table, and begins polling
-4. Enable **Auto-Play** to execute decisions (off by default = analyse/log only)
-5. Click **Stop** to end the session
+2. Click **Start** — a Chromium browser opens at adjarabet.am
+3. **Log in manually** on the Adjarabet site in that browser window
+4. Click **Continue after login** in the Streamlit sidebar
+5. The bot joins a table and begins polling (enable **Auto-Play** to click buttons)
+6. Click **Stop** to end the session
+
+Optional: set `MANUAL_LOGIN=false` in `.env` to use automated login with `ADJARABET_USERNAME` / `ADJARABET_PASSWORD`.
 
 ## Logs & debugging
 

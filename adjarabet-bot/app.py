@@ -63,6 +63,8 @@ class SessionRunner:
         self.stop_requested = False
         self.update_data: dict | None = None
         self.pl_history: list[tuple[int, float]] = []
+        self.phase = "idle"
+        self.login_event = threading.Event()
 
     def _on_update(self, data: dict) -> None:
         self.update_data = data
@@ -79,6 +81,8 @@ class SessionRunner:
         self.stop_requested = False
         self.update_data = None
         self.pl_history = []
+        self.phase = "starting"
+        self.login_event.clear()
 
         def _run() -> None:
             self.loop = asyncio.new_event_loop()
@@ -96,10 +100,15 @@ class SessionRunner:
     async def _session(self, sconf: SessionConfig) -> None:
         try:
             self.manager, self.browser = await prepare_session(
-                cfg, sconf, on_state_update=self._on_update
+                cfg,
+                sconf,
+                on_state_update=self._on_update,
+                login_event=self.login_event,
+                on_phase=lambda phase: setattr(self, "phase", phase),
             )
             if self.stop_requested:
                 return
+            self.phase = "running"
             await self.manager.start()
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
@@ -153,9 +162,11 @@ def render_sidebar() -> SessionConfig | None:
         st.title("\U0001F0CF Poker Bot")
         st.divider()
 
-        st.subheader("Account")
-        username = st.text_input("Username", value=cfg.USERNAME)
-        password = st.text_input("Password", type="password", value=cfg.PASSWORD)
+        st.subheader("Login")
+        st.info(
+            "Click **Start** — a Chromium browser opens at **adjarabet.am**. "
+            "Log in there manually, then click **Continue** below."
+        )
 
         st.subheader("Table Settings")
         limits = ["NL2", "NL5", "NL10", "NL25", "NL50"]
@@ -165,7 +176,6 @@ def render_sidebar() -> SessionConfig | None:
         stop_loss = st.number_input("Stop Loss (\u20be)", value=50.0, min_value=1.0)
 
         st.subheader("Bot Settings")
-        headless = st.checkbox("Headless Mode", value=cfg.HEADLESS)
         auto_play = st.toggle("\U0001F916 Auto-Play", value=cfg.AUTO_PLAY)
         proxy = st.text_input("SOCKS5 Proxy", value=cfg.PROXY_SERVER)
 
@@ -176,23 +186,28 @@ def render_sidebar() -> SessionConfig | None:
         stop_btn = col2.button("\u23f9 Stop", use_container_width=True,
                                disabled=not runner.is_running)
 
+        if runner.is_running and runner.phase == "waiting_login":
+            st.warning("Browser open — log in on adjarabet.am, then click Continue.")
+            if st.button("\u2713 Continue after login", use_container_width=True, type="primary"):
+                runner.login_event.set()
+                st.toast("Continuing...")
+
     if start_btn and not runner.is_running:
-        # Apply UI overrides onto the config module the bot reads from.
-        cfg.ADJARABET_USERNAME = cfg.USERNAME = username
-        cfg.ADJARABET_PASSWORD = cfg.PASSWORD = password
         cfg.PROXY_SERVER = proxy
         cfg.TABLE_LIMIT = table_limit
+        cfg.MANUAL_LOGIN = True
         bb = cfg.big_blind_for(table_limit) or 0.10
         cfg.SESSION["STOP_LOSS"] = max(1, int(stop_loss / bb))
         sconf = SessionConfig(
-            headless=headless,
+            headless=False,
             auto_play=auto_play,
             table_limit=table_limit,
             stop_loss_bb=cfg.SESSION["STOP_LOSS"],
             dry_run=not auto_play,
+            manual_login=True,
         )
         runner.start(sconf)
-        st.toast("Session starting...")
+        st.toast("Opening browser at adjarabet.am...")
 
     if stop_btn:
         runner.stop()
@@ -220,6 +235,8 @@ def status_label() -> str:
         return "\U0001F534 Error"
     if runner.is_running and runner.manager and runner.manager.running:
         return "\U0001F7E2 Running"
+    if runner.phase == "waiting_login":
+        return "\U0001F7E1 Waiting for login"
     if runner.is_running:
         return "\U0001F7E1 Connecting"
     return "\U0001F534 Stopped"

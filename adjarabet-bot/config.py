@@ -55,6 +55,9 @@ PROXY_SERVER: str = _get_str("PROXY_SERVER")
 HEADLESS: bool = _get_bool("HEADLESS", False)
 AUTO_PLAY: bool = _get_bool("AUTO_PLAY", False)
 DEBUG: bool = _get_bool("DEBUG", False)
+# When True the bot opens a visible browser at adjarabet.am and waits for you
+# to log in manually on the site (no credentials typed by the bot).
+MANUAL_LOGIN: bool = _get_bool("MANUAL_LOGIN", True)
 
 # Currency symbol used by the client (Georgian lari by default).
 CURRENCY_SYMBOL: str = _get_str("CURRENCY_SYMBOL", "\u20be")
@@ -230,7 +233,8 @@ TIMING: dict[str, float] = {
     "POLL_INTERVAL": 0.4,   # how often the scraper polls the table DOM
     "PAGE_TIMEOUT": 30.0,   # default Playwright navigation/selector timeout
     "ACTION_TIMEOUT": 10.0, # timeout when waiting for an action button
-    "LOGIN_TIMEOUT": 30.0,  # max seconds to wait for login success/failure
+    "LOGIN_TIMEOUT": 30.0,  # max seconds for automated .env credential login
+    "MANUAL_LOGIN_TIMEOUT": 300.0,  # max seconds to wait for manual login in browser
     "BET_OPEN_DELAY_MIN": 0.4,
     "BET_OPEN_DELAY_MAX": 0.6,
     "BET_CONFIRM_DELAY": 0.3,

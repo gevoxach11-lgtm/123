@@ -1,7 +1,10 @@
 """Adjarabet authentication flow.
 
-:class:`AuthManager` logs into the site using credentials from the supplied
-config. All CSS selectors are read from :mod:`config` — never hardcoded here.
+By default the bot opens a visible browser at adjarabet.am and waits for you
+to log in manually on the site. Automated credential login (from ``.env``) is
+optional when ``MANUAL_LOGIN=false``.
+
+All CSS selectors are read from :mod:`config` — never hardcoded here.
 """
 
 from __future__ import annotations
@@ -198,11 +201,70 @@ class AuthManager:
         await capture_page_error(self.page, self.config, "auth_timeout")
         return False
 
-    async def ensure_logged_in(self) -> bool:
-        """Log in only if not already authenticated."""
+    async def wait_for_manual_login(self, confirm_event=None) -> bool:
+        """Open adjarabet.am in the browser and wait for the user to log in."""
+        base_url = self._cfg("BASE_URL", "")
+        timeout = self._timing("MANUAL_LOGIN_TIMEOUT", 300.0)
+        poll = self._timing("TURN_WAIT_POLL", 0.5)
+
+        try:
+            logger.info("Opening {} — log in manually in the browser window", base_url)
+            await self.page.goto(base_url, wait_until="domcontentloaded")
+        except Exception as exc:
+            await capture_page_error(self.page, self.config, "auth_goto", exc)
+            return False
+
+        if await self._detect_geo_block():
+            logger.error(
+                "Adjarabet geo-block page detected — site unavailable from this "
+                "region/IP. Use a SOCKS5 proxy (PROXY_SERVER in .env) or run locally "
+                "from an allowed country."
+            )
+            await capture_page_error(self.page, self.config, "auth_geo_blocked")
+            return False
+
+        if await self.is_logged_in():
+            logger.success("Already logged in")
+            return True
+
+        logger.info(
+            "Waiting for manual login (up to {:.0f}s). "
+            "Use the Chromium window to sign in on adjarabet.am, "
+            "then click Continue in the dashboard.",
+            timeout,
+        )
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            try:
+                if confirm_event is not None and confirm_event.is_set():
+                    logger.success("Manual login confirmed from dashboard")
+                    return True
+                if await self.is_logged_in():
+                    logger.success("Manual login detected on page")
+                    return True
+            except Exception as exc:
+                await capture_page_error(self.page, self.config, "auth_manual_wait", exc)
+            await asyncio.sleep(poll)
+
+        logger.error("Manual login timed out after {:.0f}s", timeout)
+        await capture_page_error(self.page, self.config, "auth_manual_timeout")
+        return False
+
+    async def ensure_logged_in(
+        self,
+        manual: bool | None = None,
+        confirm_event=None,
+    ) -> bool:
+        """Authenticate via manual browser login or automated .env credentials."""
         if await self.is_logged_in():
             logger.info("Session already authenticated")
             return True
+
+        use_manual = self._cfg("MANUAL_LOGIN", True) if manual is None else manual
+        if use_manual:
+            return await self.wait_for_manual_login(confirm_event=confirm_event)
         return await self.login()
 
 

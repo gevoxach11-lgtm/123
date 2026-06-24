@@ -59,6 +59,7 @@ class SessionConfig:
     max_minutes: int = field(default_factory=lambda: _config_module.SESSION["MAX_MINUTES"])
     stop_loss_bb: int = field(default_factory=lambda: _config_module.SESSION["STOP_LOSS"])
     dry_run: bool = False  # if True, decide but don't click
+    manual_login: bool = field(default_factory=lambda: _config_module.MANUAL_LOGIN)
 
 
 class SessionManager:
@@ -321,15 +322,36 @@ class SessionManager:
 # --------------------------------------------------------------------------- #
 # Orchestration: build a ready-to-run session (browser + auth + lobby + deps)
 # --------------------------------------------------------------------------- #
-async def prepare_session(config, cfg: SessionConfig, on_state_update=None):
+async def prepare_session(
+    config,
+    cfg: SessionConfig,
+    on_state_update=None,
+    login_event=None,
+    on_phase=None,
+):
     """Launch the browser, log in, join a table and wire up a SessionManager."""
-    browser = BrowserManager(config, headless=cfg.headless)
+    headless = cfg.headless
+    if cfg.manual_login and headless:
+        logger.warning("Manual login requires a visible browser; forcing headless=False")
+        headless = False
+
+    browser = BrowserManager(config, headless=headless)
     page = None
     try:
         page = await browser.launch()
         auth = AuthManager(page, config)
-        if not await auth.ensure_logged_in():
-            raise RuntimeError("Login failed - check credentials/selectors")
+        if on_phase:
+            on_phase("waiting_login")
+        if not await auth.ensure_logged_in(
+            manual=cfg.manual_login,
+            confirm_event=login_event,
+        ):
+            raise RuntimeError(
+                "Login failed — log in manually in the browser or set MANUAL_LOGIN=false "
+                "with credentials in .env"
+            )
+        if on_phase:
+            on_phase("joining_table")
 
         lobby = LobbyNavigator(page, config)
         if not await lobby.find_and_join(cfg.table_limit):
