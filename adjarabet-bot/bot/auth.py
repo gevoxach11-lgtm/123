@@ -66,6 +66,17 @@ class AuthManager:
         except Exception:
             return False
 
+    async def _detect_geo_block(self) -> bool:
+        """Return True if the site shows a geo-restriction / unavailable page."""
+        try:
+            title = self.page.locator(".alert-container .title").first
+            if await title.count() == 0:
+                return False
+            text = (await title.inner_text()).strip().lower()
+            return "not available" in text or "unavailable" in text
+        except Exception:
+            return False
+
     async def _error_text(self) -> str | None:
         for css in self._selectors("login_error"):
             try:
@@ -124,6 +135,15 @@ class AuthManager:
             return False
 
         await think_delay()
+
+        if await self._detect_geo_block():
+            logger.error(
+                "Adjarabet geo-block page detected — site unavailable from this "
+                "region/IP. Use a SOCKS5 proxy (PROXY_SERVER in .env) or run locally "
+                "from an allowed country."
+            )
+            await capture_page_error(self.page, self.config, "auth_geo_blocked")
+            return False
 
         if await self.is_logged_in():
             logger.success("Already logged in")

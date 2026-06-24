@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import config
+import config as _default_config
 from utils.human import human_click, think_delay
 from utils.logger import get_logger
 
@@ -28,15 +28,16 @@ class TableInfo:
 class LobbyNavigator:
     """Navigate the poker lobby and seat the bot at a table."""
 
-    def __init__(self, page) -> None:
+    def __init__(self, page, config=None) -> None:
         self.page = page
-        self.sel = config.SELECTORS
+        self.config = config or _default_config
+        self.sel = getattr(self.config, "SELECTORS", {}) or _default_config.SELECTORS
 
     async def open_poker(self) -> bool:
         """Navigate to the poker lobby."""
         logger.info("Opening poker lobby")
         try:
-            await self.page.goto(config.POKER_URL, wait_until="domcontentloaded")
+            await self.page.goto(self.config.POKER_URL, wait_until="domcontentloaded")
         except Exception as exc:
             logger.warning("Direct poker URL nav failed ({}); trying menu", exc)
             if not await human_click(self.page, self.sel["poker_menu"]):
@@ -71,7 +72,7 @@ class LobbyNavigator:
 
         Falls back to the first available table if no exact match is found.
         """
-        limit = (limit or config.TABLE_LIMIT).upper()
+        limit = (limit or self.config.TABLE_LIMIT).upper()
         tables = await self.list_tables()
         if not tables:
             logger.warning("No tables visible in lobby")
