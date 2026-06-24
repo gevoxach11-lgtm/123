@@ -51,6 +51,10 @@ TABLE_LIMIT: str = _get_str("TABLE_LIMIT", "NL10")
 PROXY_SERVER: str = _get_str("PROXY_SERVER")
 HEADLESS: bool = _get_bool("HEADLESS", False)
 AUTO_PLAY: bool = _get_bool("AUTO_PLAY", False)
+DEBUG: bool = _get_bool("DEBUG", False)
+
+# Currency symbol used by the client (Georgian lari by default).
+CURRENCY_SYMBOL: str = _get_str("CURRENCY_SYMBOL", "\u20be")
 
 # Base site URLs (override via .env if Adjarabet changes domains).
 BASE_URL: str = _get_str("ADJARABET_BASE_URL", "https://www.adjarabet.am")

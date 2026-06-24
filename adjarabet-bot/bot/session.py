@@ -112,7 +112,7 @@ class SessionManager:
 
     async def play_loop(self, page) -> None:
         """Poll the table and act when it's hero's turn."""
-        scraper = TableScraper(page)
+        scraper = TableScraper(page, config)
         engine = PokerEngine()
         executor = ActionExecutor(page, dry_run=self.cfg.dry_run or not self.cfg.auto_play)
 
@@ -121,7 +121,10 @@ class SessionManager:
 
         while not self._should_stop():
             try:
-                state = await scraper.scrape()
+                state = await scraper.get_game_state()
+                if state is None:
+                    await asyncio.sleep(poll)
+                    continue
                 self.last_state = state
                 self._track_hand_transition(state)
 

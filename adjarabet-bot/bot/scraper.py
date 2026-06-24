@@ -1,16 +1,22 @@
-"""Table scraper: read the live DOM into a :class:`GameState`.
+"""Table scraper: read the live Adjarabet poker DOM into a :class:`GameState`.
 
-The scraper translates the poker client's HTML into the structured models the
-engine understands. Selectors are placeholders in ``config.SELECTORS``; the
-parsing logic is defensive so missing/garbled data degrades gracefully rather
-than crashing the loop.
+Adjarabet runs a browser-based client (Microgaming / Babelfish). Every game
+element lives in HTML - cards, chips, player boxes and action buttons - but the
+exact markup is unknown, so this scraper uses several fallback strategies per
+field, combining CSS attribute selectors with viewport geometry (the hero seat
+sits at the bottom-centre, the board at the vertical centre, etc.).
+
+All public methods are defensive: missing or unparseable data degrades to sane
+defaults instead of raising, so the polling loop never crashes on a bad frame.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
-import config
+import config as _default_config
+from poker.evaluator import parse_card
 from poker.models import (
     ActionType,
     Card,
@@ -23,68 +29,647 @@ from utils.logger import get_logger
 
 logger = get_logger()
 
-_NUM_RE = re.compile(r"[-+]?\d[\d,]*\.?\d*")
+_NUM_RE = re.compile(r"[-+]?\d[\d ]*\.?\d*")
+
+_RANK_WORDS = "ace|king|queen|jack|ten|nine|eight|seven|six|five|four|three|two|deuce"
+_SUIT_WORDS = "heart|diamond|club|spade"
+_SRC_WORD_OF = re.compile(rf"({_RANK_WORDS})\w*[ _\-]*of[ _\-]*({_SUIT_WORDS})")
+_SRC_WORD_ADJ = re.compile(rf"({_RANK_WORDS})\w*[ _\-]+({_SUIT_WORDS})")
+_SRC_COMPACT = re.compile(r"(?<![a-z])(10|[2-9tjqka])[ _\-]?([hdcs])(?![a-z])")
+
+# Keyword -> canonical action (English + Georgian).
+_ACTION_KEYWORDS = {
+    "fold": ["fold", "\u10d3\u10d0\u10d9\u10d4\u10ea\u10d5\u10d0"],         # დაკეცვა
+    "check": ["check", "\u10d2\u10d0\u10d5\u10da\u10d0"],                    # გავლა
+    "call": ["call", "\u10d2\u10d0\u10d7\u10d0\u10dc\u10d0\u10d1\u10d0"],   # გათანაბება
+    "bet": ["bet", "\u10e4\u10e1\u10d8"],                                    # ფსონი
+    "raise": ["raise", "\u10db\u10d0\u10e2\u10d4\u10d1\u10d0"],             # მატება
+}
 
 
+# --------------------------------------------------------------------------- #
+# Module-level parsing helpers (pure / unit-testable)
+# --------------------------------------------------------------------------- #
 def parse_amount(text: str | None) -> float:
-    """Extract a numeric amount from messy UI text like ``'$1,234.50'``."""
+    """Extract a numeric amount from messy UI text like ``'Call \u20be5.00'``."""
     if not text:
         return 0.0
-    match = _NUM_RE.search(text.replace(",", ""))
+    cleaned = text.replace(",", "").replace("\u00a0", " ")
+    match = _NUM_RE.search(cleaned)
     if not match:
         return 0.0
     try:
-        return float(match.group())
+        return float(match.group().replace(" ", ""))
     except ValueError:
         return 0.0
 
 
-def parse_card(text: str | None) -> Card | None:
-    """Parse a card from text/attribute such as ``'Ah'`` or ``'10s'``."""
-    if not text:
+def parse_card_from_src(src: str | None) -> Card | None:
+    """Parse a card from an image src / class / filename.
+
+    Handles ``"card_ah.png"`` (-> A\u2665), ``"ace_of_hearts.svg"`` and
+    ``"10h"``. Word forms are tried before the compact form so that strings
+    like ``"hearts"`` are not mis-read as ``Ts``.
+    """
+    if not src:
         return None
-    try:
-        return Card.from_str(text)
-    except Exception:
-        return None
+    s = src.lower()
+    m = _SRC_WORD_OF.search(s) or _SRC_WORD_ADJ.search(s)
+    if m:
+        card = parse_card(f"{m.group(1)} of {m.group(2)}s")
+        if card:
+            return card
+    m = _SRC_COMPACT.search(s)
+    if m:
+        card = parse_card(m.group(1) + m.group(2))
+        if card:
+            return card
+    return None
 
 
 class TableScraper:
-    """Read the poker table DOM and build a GameState snapshot."""
+    """Read the poker table DOM and build a :class:`GameState` snapshot."""
 
-    def __init__(self, page) -> None:
+    def __init__(self, page, config=None) -> None:
         self.page = page
-        self.sel = config.SELECTORS
-        self.big_blind = config.big_blind_for()
+        self.config = config or _default_config
+        self._vw = 0
+        self._vh = 0
 
-    async def scrape(self) -> GameState:
-        """Return a best-effort snapshot of the current table state."""
-        state = GameState(big_blind=self.big_blind)
+    def _cfg(self, name: str, default=None):
+        return getattr(self.config, name, default)
 
-        state.hand_id = await self._text(self.sel["hand_id"])
-        state.pot = parse_amount(await self._text(self.sel["pot_size"]))
-        state.my_stack = parse_amount(await self._text(self.sel["my_stack"]))
-        state.my_bet = parse_amount(await self._text(self.sel["my_bet"]))
+    # ------------------------------------------------------------------ #
+    # Top-level collector
+    # ------------------------------------------------------------------ #
+    async def get_game_state(self) -> GameState | None:
+        """Collect all state into a :class:`GameState`, or ``None`` if no table."""
+        await self._refresh_viewport()
 
-        state.my_cards = await self._cards(self.sel["my_hole_card"])
-        state.community_cards = await self._cards(self.sel["community_card"])
-        state.round = self._street_from_board(len(state.community_cards))
+        hole = await self.find_hole_cards()
+        community = await self.find_community_cards()
+        players = await self.find_players()
+        pot = await self.find_pot()
+        my_stack = await self.find_my_stack()
+        call_amount = await self.find_call_amount()
+        actions = await self.find_action_buttons()
+        my_turn = len(actions) > 0
+        position = await self.detect_position()
+        round_name = await self.detect_current_round(community)
 
-        state.players = await self._players()
-        state.position = self._derive_hero_position(state.players)
+        # Can we actually see a table? Require at least one concrete signal.
+        if not any([hole, community, players, pot, actions]):
+            if not await self._table_present():
+                logger.debug("No poker table detected")
+                if self._cfg("DEBUG", False):
+                    await self.dump_debug()
+                return None
 
-        state.available_actions = await self._available_actions()
-        state.call_amount = parse_amount(await self._text(self.sel["call_button"]))
-        state.is_my_turn = len(state.available_actions) > 0
-        state.time_left = parse_amount(await self._text(self.sel["turn_timer"]))
+        hero = next((p for p in players if p.is_hero), None)
+        my_bet = hero.bet if hero else 0.0
+        if my_stack <= 0 and hero:
+            my_stack = hero.stack
 
-        logger.debug("Scraped state: {}", state)
+        big_blind = self._big_blind()
+        state = GameState(
+            hand_id=await self._find_hand_id(),
+            my_cards=hole,
+            community_cards=community,
+            pot=pot,
+            my_stack=my_stack,
+            my_bet=my_bet,
+            call_amount=call_amount,
+            players=players,
+            round=self._street(round_name),
+            position=self._position(position),
+            available_actions=[self._action(a) for a in actions if self._action(a)],
+            is_my_turn=my_turn,
+            time_left=await self._find_time_left(),
+            big_blind=big_blind,
+        )
+        logger.debug("Scraped: {}", state)
         return state
+
+    # Backward-compatible alias.
+    async def scrape(self) -> GameState | None:
+        return await self.get_game_state()
+
+    # ------------------------------------------------------------------ #
+    # Cards
+    # ------------------------------------------------------------------ #
+    async def find_hole_cards(self) -> list[Card]:
+        """Find the hero's two hole cards using several fallbacks."""
+        await self._ensure_viewport()
+        cx = self._vw / 2 if self._vw else 0
+
+        # Strategy 1: generic card elements near the bottom-centre.
+        bottom: list[Card] = []
+        for handle in await self._els('[class*="card" i]'):
+            if not await self._is_visible(handle):
+                continue
+            box = await self._box(handle)
+            if not box:
+                continue
+            yc = box["y"] + box["height"] / 2
+            xc = box["x"] + box["width"] / 2
+            if self._vh and yc >= self._vh * 0.6 and abs(xc - cx) <= 300:
+                card = await self._card_from_element(handle)
+                if card:
+                    bottom.append(card)
+        cards = self._dedupe(bottom)
+        if len(cards) >= 2:
+            return cards[:2]
+
+        # Strategy 2: card images, parse rank/suit from the filename.
+        imgs: list[Card] = []
+        for handle in await self._els('img[src*="card" i]'):
+            if not await self._is_visible(handle):
+                continue
+            src = await self._attr(handle, "src")
+            card = parse_card_from_src(src)
+            if card:
+                imgs.append(card)
+        cards = self._dedupe(imgs)
+        if len(cards) >= 2:
+            return cards[:2]
+
+        # Strategy 3: explicit data attributes.
+        data_cards: list[Card] = []
+        for handle in await self._els("[data-rank][data-suit]"):
+            card = await self._card_from_data(handle)
+            if card:
+                data_cards.append(card)
+        cards = self._dedupe(data_cards)
+        if len(cards) >= 2:
+            return cards[:2]
+
+        # Strategy 4: explicit "hole" container.
+        hole_cards: list[Card] = []
+        for handle in await self._els('[class*="hole" i] [class*="card" i]'):
+            card = await self._card_from_element(handle)
+            if card:
+                hole_cards.append(card)
+        cards = self._dedupe(hole_cards)
+        return cards[:2]
+
+    async def find_community_cards(self) -> list[Card]:
+        """Find the 0/3/4/5 community (board) cards."""
+        await self._ensure_viewport()
+        for selector in (
+            '[class*="community" i] [class*="card" i]',
+            '[class*="board" i] [class*="card" i]',
+        ):
+            found: list[Card] = []
+            for handle in await self._els(selector):
+                if not await self._is_visible(handle):
+                    continue
+                card = await self._card_from_element(handle)
+                if card:
+                    found.append(card)
+            cards = self._dedupe(found)
+            if cards:
+                return cards[:5]
+
+        # Geometry fallback: cards near the vertical centre (and not the hero's
+        # bottom cards).
+        if not self._vh:
+            return []
+        center = self._vh / 2
+        center_cards: list[Card] = []
+        for handle in await self._els('[class*="card" i]'):
+            if not await self._is_visible(handle):
+                continue
+            box = await self._box(handle)
+            if not box:
+                continue
+            yc = box["y"] + box["height"] / 2
+            if abs(yc - center) <= 200 and yc < self._vh * 0.6:
+                card = await self._card_from_element(handle)
+                if card:
+                    center_cards.append(card)
+        return self._dedupe(center_cards)[:5]
+
+    # ------------------------------------------------------------------ #
+    # Money
+    # ------------------------------------------------------------------ #
+    async def find_pot(self) -> float:
+        """Read the pot size."""
+        await self._ensure_viewport()
+        for handle in await self._els('[class*="pot" i]'):
+            if not await self._is_visible(handle):
+                continue
+            amount = parse_amount(await self._text(handle))
+            if amount > 0:
+                return amount
+
+        # Fallback: a "total" element near the centre.
+        cx, cy = self._vw / 2, self._vh / 2
+        best = 0.0
+        for handle in await self._els('[class*="total" i]'):
+            box = await self._box(handle)
+            if not box:
+                continue
+            xc, yc = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+            if abs(xc - cx) <= 400 and abs(yc - cy) <= 300:
+                best = max(best, parse_amount(await self._text(handle)))
+        if best > 0:
+            return best
+
+        # Fallback: any element containing the currency symbol near the centre.
+        symbol = self._cfg("CURRENCY_SYMBOL", "\u20be")
+        for handle in await self._els(f"xpath=//*[contains(text(), '{symbol}')]"):
+            box = await self._box(handle)
+            if not box:
+                continue
+            yc = box["y"] + box["height"] / 2
+            if self._vh and abs(yc - self._vh / 2) <= 200:
+                amount = parse_amount(await self._text(handle))
+                if amount > 0:
+                    return amount
+        return 0.0
+
+    async def find_my_stack(self) -> float:
+        """Read the hero's stack from the bottom of the viewport."""
+        await self._ensure_viewport()
+        for selector in ('[class*="stack" i]', '[class*="chips" i]'):
+            best = 0.0
+            for handle in await self._els(selector):
+                if not await self._is_visible(handle):
+                    continue
+                box = await self._box(handle)
+                if not box:
+                    continue
+                yc = box["y"] + box["height"] / 2
+                if self._vh and yc >= self._vh * 0.5:
+                    best = max(best, parse_amount(await self._text(handle)))
+            if best > 0:
+                return best
+        return 0.0
+
+    async def find_call_amount(self) -> float:
+        """Read the call amount from the Call button text (0 if none)."""
+        for handle in await self._action_button_handles():
+            text = (await self._text(handle)).lower()
+            if any(kw in text for kw in _ACTION_KEYWORDS["call"]):
+                if await self._is_visible(handle) and await self._is_enabled(handle):
+                    return parse_amount(text)
+        return 0.0
+
+    # ------------------------------------------------------------------ #
+    # Players
+    # ------------------------------------------------------------------ #
+    async def find_players(self) -> list[Player]:
+        """Find seated players and their name/stack/bet/active status."""
+        await self._ensure_viewport()
+        players: list[Player] = []
+        seats = await self._els('[class*="seat" i]')
+        if not seats:
+            seats = await self._els('[class*="player" i]')
+
+        cx = self._vw / 2 if self._vw else 0
+        for i, seat in enumerate(seats):
+            klass = (await self._attr(seat, "class") or "").lower()
+            if any(tag in klass for tag in ("empty", "vacant", "available")):
+                continue
+            name = await self._child_text(seat, '[class*="name" i]')
+            stack = parse_amount(
+                await self._child_text(seat, '[class*="stack" i]')
+                or await self._child_text(seat, '[class*="chips" i]')
+            )
+            bet = parse_amount(await self._child_text(seat, '[class*="bet" i]'))
+            is_active = not any(tag in klass for tag in ("fold", "inactive", "sitout"))
+            is_dealer = await self._child_exists(seat, '[class*="dealer" i]')
+
+            is_hero = any(tag in klass for tag in ("hero", "self", "me", "active-player"))
+            if not is_hero:
+                box = await self._box(seat)
+                if box and self._vh:
+                    yc = box["y"] + box["height"] / 2
+                    xc = box["x"] + box["width"] / 2
+                    if yc >= self._vh * 0.6 and abs(xc - cx) <= 350:
+                        is_hero = True
+
+            players.append(
+                Player(
+                    seat=i,
+                    name=name,
+                    stack=stack,
+                    bet=bet,
+                    is_active=is_active,
+                    is_hero=is_hero,
+                    is_dealer=is_dealer,
+                )
+            )
+        return players
+
+    # ------------------------------------------------------------------ #
+    # Actions / turn
+    # ------------------------------------------------------------------ #
+    async def find_action_buttons(self) -> list[str]:
+        """Return canonical actions whose buttons are visible AND enabled."""
+        found: set[str] = set()
+        for handle in await self._action_button_handles():
+            if not await self._is_visible(handle) or not await self._is_enabled(handle):
+                continue
+            text = (await self._text(handle)).lower()
+            for action, keywords in _ACTION_KEYWORDS.items():
+                if any(kw in text for kw in keywords):
+                    found.add(action)
+        # Preserve a stable, meaningful order.
+        order = ["fold", "check", "call", "bet", "raise"]
+        return [a for a in order if a in found]
+
+    async def is_my_turn(self) -> bool:
+        """True if any fold/check/call action button is visible & enabled."""
+        actions = await self.find_action_buttons()
+        return any(a in actions for a in ("fold", "check", "call"))
+
+    # ------------------------------------------------------------------ #
+    # Position / round
+    # ------------------------------------------------------------------ #
+    async def detect_position(self) -> str:
+        """Estimate the hero's position relative to the dealer button."""
+        await self._ensure_viewport()
+        seats = await self._els('[class*="seat" i]') or await self._els('[class*="player" i]')
+        centers: list[tuple[float, float]] = []
+        hero_idx = -1
+        dealer_idx = -1
+        cx = self._vw / 2 if self._vw else 0
+
+        for i, seat in enumerate(seats):
+            box = await self._box(seat)
+            if not box:
+                centers.append((0.0, 0.0))
+                continue
+            xc = box["x"] + box["width"] / 2
+            yc = box["y"] + box["height"] / 2
+            centers.append((xc, yc))
+            klass = (await self._attr(seat, "class") or "").lower()
+            if hero_idx < 0 and (
+                any(t in klass for t in ("hero", "self", "me"))
+                or (self._vh and yc >= self._vh * 0.6 and abs(xc - cx) <= 350)
+            ):
+                hero_idx = i
+            if await self._child_exists(seat, '[class*="dealer" i]'):
+                dealer_idx = i
+
+        n = len(seats)
+        if n == 0 or hero_idx < 0 or dealer_idx < 0:
+            return "MP"
+
+        # Order seats clockwise around the table centre.
+        tcx = sum(c[0] for c in centers) / n
+        tcy = sum(c[1] for c in centers) / n
+        import math
+        angles = sorted(
+            range(n),
+            key=lambda i: math.atan2(centers[i][1] - tcy, centers[i][0] - tcx),
+        )
+        order = angles  # clockwise-ish ordering of seat indices
+        try:
+            d_pos = order.index(dealer_idx)
+            h_pos = order.index(hero_idx)
+        except ValueError:
+            return "MP"
+        offset = (h_pos - d_pos) % n
+
+        # Names for seats after the button, 6-max style.
+        names = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+        if offset < len(names):
+            return names[offset]
+        return "MP"
+
+    async def detect_current_round(self, community: list) -> str:
+        """Map the number of board cards to the betting round."""
+        return {0: "preflop", 3: "flop", 4: "turn", 5: "river"}.get(len(community), "preflop")
+
+    # ------------------------------------------------------------------ #
+    # Waiting / debug
+    # ------------------------------------------------------------------ #
+    async def wait_for_my_turn(self, timeout: int = 120) -> GameState | None:
+        """Poll :meth:`is_my_turn` every 0.5s; return state when it's our turn."""
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if await self.is_my_turn():
+                return await self.get_game_state()
+            await asyncio.sleep(0.5)
+        logger.warning("wait_for_my_turn timed out after {}s", timeout)
+        return None
+
+    async def dump_debug(self) -> None:
+        """Dump cards/buttons/HTML/screenshot when DEBUG mode is enabled."""
+        if not self._cfg("DEBUG", False):
+            return
+        logger.debug("--- DEBUG DUMP ---")
+        try:
+            for handle in await self._els('[class*="card" i]'):
+                logger.debug("card el: class={} text={!r}",
+                             await self._attr(handle, "class"), await self._text(handle))
+            for handle in await self._action_button_handles():
+                if await self._is_visible(handle):
+                    logger.debug("button: text={!r} enabled={}",
+                                 await self._text(handle), await self._is_enabled(handle))
+        except Exception as exc:  # pragma: no cover
+            logger.warning("debug element dump failed: {}", exc)
+
+        log_dir = self._cfg("LOG_DIR", None)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            html = await self.page.content()
+            if log_dir is not None:
+                html_path = log_dir / f"debug_{timestamp}.html"
+                html_path.write_text(html, encoding="utf-8")
+                logger.debug("Saved page HTML -> {}", html_path)
+                await self.page.screenshot(path=str(log_dir / f"debug_{timestamp}.png"))
+        except Exception as exc:  # pragma: no cover
+            logger.warning("debug dump failed: {}", exc)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
-    async def _text(self, selector: str) -> str:
+    async def _refresh_viewport(self) -> None:
+        vp = getattr(self.page, "viewport_size", None)
+        if isinstance(vp, dict) and vp.get("width") and vp.get("height"):
+            self._vw, self._vh = vp["width"], vp["height"]
+            return
+        try:
+            size = await self.page.evaluate(
+                "() => ({w: window.innerWidth, h: window.innerHeight})"
+            )
+            self._vw, self._vh = size["w"], size["h"]
+        except Exception:
+            self._vw, self._vh = self._vw or 1920, self._vh or 1080
+
+    async def _ensure_viewport(self) -> None:
+        """Fetch viewport dimensions lazily if not already known."""
+        if not self._vw or not self._vh:
+            await self._refresh_viewport()
+
+    def _big_blind(self) -> float:
+        getter = getattr(self.config, "big_blind_for", None)
+        if callable(getter):
+            return getter()
+        return 0.10
+
+    async def _table_present(self) -> bool:
+        selectors = self._cfg("SELECTORS", {}) or {}
+        candidates = [
+            selectors.get("table_container", ".poker-table"),
+            '[class*="table" i]',
+            '[class*="poker" i]',
+        ]
+        for selector in candidates:
+            try:
+                if await self.page.locator(selector).first.count() > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _find_hand_id(self) -> str:
+        selectors = self._cfg("SELECTORS", {}) or {}
+        for selector in (selectors.get("hand_id", ".hand-id"), '[class*="hand-id" i]', '[class*="handid" i]'):
+            text = await self._first_text(selector)
+            if text:
+                return text.strip()
+        return ""
+
+    async def _find_time_left(self) -> float:
+        selectors = self._cfg("SELECTORS", {}) or {}
+        for selector in (selectors.get("turn_timer", ".timer"), '[class*="timer" i]', '[class*="time-left" i]'):
+            text = await self._first_text(selector)
+            if text:
+                return parse_amount(text)
+        return 0.0
+
+    async def _action_button_handles(self) -> list:
+        handles = await self._els('button, [role="button"], [class*="btn" i], [class*="action" i] button')
+        return handles
+
+    async def _card_from_element(self, handle) -> Card | None:
+        card = await self._card_from_data(handle)
+        if card:
+            return card
+        # Nested img or self src.
+        img = await self._query(handle, "img")
+        src = await self._attr(img, "src") if img else await self._attr(handle, "src")
+        card = parse_card_from_src(src)
+        if card:
+            return card
+        # Class name often encodes the card, e.g. "card rank-a suit-h".
+        card = parse_card_from_src(await self._attr(handle, "class"))
+        if card:
+            return card
+        # Text / aria-label.
+        for value in (await self._text(handle), await self._attr(handle, "aria-label"),
+                      await self._attr(handle, "title"), await self._attr(handle, "alt")):
+            if value:
+                card = parse_card(value) or parse_card_from_src(value)
+                if card:
+                    return card
+        return None
+
+    async def _card_from_data(self, handle) -> Card | None:
+        rank = await self._attr(handle, "data-rank")
+        suit = await self._attr(handle, "data-suit")
+        if not rank or not suit:
+            return None
+        rank = rank.strip().upper()
+        if rank == "10":
+            rank = "T"
+        suit_map = {
+            "h": "h", "hearts": "h", "heart": "h",
+            "d": "d", "diamonds": "d", "diamond": "d",
+            "c": "c", "clubs": "c", "club": "c",
+            "s": "s", "spades": "s", "spade": "s",
+        }
+        suit_char = suit_map.get(suit.strip().lower(), suit.strip().lower()[:1])
+        return parse_card(f"{rank}{suit_char}")
+
+    @staticmethod
+    def _dedupe(cards: list[Card]) -> list[Card]:
+        seen: set[str] = set()
+        out: list[Card] = []
+        for card in cards:
+            code = card.code()
+            if code not in seen:
+                seen.add(code)
+                out.append(card)
+        return out
+
+    # --- Enum mapping helpers ---
+    @staticmethod
+    def _street(name: str) -> Street:
+        try:
+            return Street(name)
+        except ValueError:
+            return Street.PREFLOP
+
+    @staticmethod
+    def _position(name: str) -> Position:
+        try:
+            return Position(name)
+        except ValueError:
+            return Position.UNKNOWN
+
+    @staticmethod
+    def _action(name: str) -> ActionType | None:
+        try:
+            return ActionType(name)
+        except ValueError:
+            return None
+
+    # --- Low-level Playwright wrappers (never raise) ---
+    async def _els(self, selector: str) -> list:
+        try:
+            return await self.page.query_selector_all(selector)
+        except Exception:
+            return []
+
+    async def _query(self, handle, selector: str):
+        try:
+            return await handle.query_selector(selector)
+        except Exception:
+            return None
+
+    async def _box(self, handle):
+        try:
+            return await handle.bounding_box()
+        except Exception:
+            return None
+
+    async def _is_visible(self, handle) -> bool:
+        try:
+            return await handle.is_visible()
+        except Exception:
+            return False
+
+    async def _is_enabled(self, handle) -> bool:
+        try:
+            return await handle.is_enabled()
+        except Exception:
+            return True
+
+    async def _attr(self, handle, name: str) -> str | None:
+        if handle is None:
+            return None
+        try:
+            return await handle.get_attribute(name)
+        except Exception:
+            return None
+
+    async def _text(self, handle) -> str:
+        if handle is None:
+            return ""
+        try:
+            return (await handle.inner_text()).strip()
+        except Exception:
+            return ""
+
+    async def _first_text(self, selector: str) -> str:
         try:
             locator = self.page.locator(selector).first
             if await locator.count() == 0:
@@ -93,138 +678,15 @@ class TableScraper:
         except Exception:
             return ""
 
-    async def _cards(self, selector: str) -> list[Card]:
-        cards: list[Card] = []
-        try:
-            locator = self.page.locator(selector)
-            count = await locator.count()
-        except Exception:
-            return cards
-        for i in range(count):
-            el = locator.nth(i)
-            # Card value may be in text or a data attribute.
-            text = ""
-            try:
-                text = (await el.inner_text()).strip()
-            except Exception:
-                pass
-            if not text:
-                for attr in ("data-card", "data-value", "alt", "title"):
-                    try:
-                        val = await el.get_attribute(attr)
-                    except Exception:
-                        val = None
-                    if val:
-                        text = val
-                        break
-            card = parse_card(text)
-            if card:
-                cards.append(card)
-        return cards
+    async def _child_text(self, parent, selector: str) -> str:
+        child = await self._query(parent, selector)
+        return await self._text(child)
 
-    async def _players(self) -> list[Player]:
-        players: list[Player] = []
+    async def _child_exists(self, parent, selector: str) -> bool:
         try:
-            seats = self.page.locator(self.sel["seat"])
-            count = await seats.count()
-        except Exception:
-            return players
-        for i in range(count):
-            seat = seats.nth(i)
-            name = await self._child_text(seat, self.sel["seat_name"])
-            stack = parse_amount(await self._child_text(seat, self.sel["seat_stack"]))
-            bet = parse_amount(await self._child_text(seat, self.sel["seat_bet"]))
-            is_dealer = await self._child_exists(seat, self.sel["dealer_button"])
-            klass = await self._attr(seat, "class")
-            is_active = "folded" not in (klass or "").lower()
-            is_hero = "hero" in (klass or "").lower()
-            players.append(
-                Player(
-                    seat=i,
-                    name=name,
-                    stack=stack,
-                    bet=bet,
-                    is_active=is_active,
-                    is_dealer=is_dealer,
-                    is_hero=is_hero,
-                )
-            )
-        return players
-
-    async def _available_actions(self) -> list[ActionType]:
-        actions: list[ActionType] = []
-        mapping = {
-            ActionType.FOLD: self.sel["fold_button"],
-            ActionType.CHECK: self.sel["check_button"],
-            ActionType.CALL: self.sel["call_button"],
-            ActionType.BET: self.sel["bet_button"],
-            ActionType.RAISE: self.sel["raise_button"],
-        }
-        for action, selector in mapping.items():
-            if await self._is_actionable(selector):
-                actions.append(action)
-        return actions
-
-    async def _is_actionable(self, selector: str) -> bool:
-        try:
-            locator = self.page.locator(selector).first
-            if await locator.count() == 0:
-                return False
-            if not await locator.is_visible():
-                return False
-            return await locator.is_enabled()
+            return await parent.query_selector(selector) is not None
         except Exception:
             return False
 
-    def _derive_hero_position(self, players: list[Player]) -> Position:
-        """Approximate hero position from seat offset relative to the button."""
-        hero = next((p for p in players if p.is_hero), None)
-        dealer = next((p for p in players if p.is_dealer), None)
-        if not hero or not dealer or not players:
-            return Position.UNKNOWN
-        n = len(players)
-        offset = (hero.seat - dealer.seat) % n
-        # 6-max position mapping by seats after the button.
-        order = [
-            Position.BTN, Position.SB, Position.BB,
-            Position.UTG, Position.MP, Position.CO,
-        ]
-        if offset < len(order):
-            return order[offset]
-        return Position.UNKNOWN
 
-    @staticmethod
-    def _street_from_board(num_board: int) -> Street:
-        return {
-            0: Street.PREFLOP,
-            3: Street.FLOP,
-            4: Street.TURN,
-            5: Street.RIVER,
-        }.get(num_board, Street.PREFLOP)
-
-    @staticmethod
-    async def _child_text(parent, selector: str) -> str:
-        try:
-            loc = parent.locator(selector).first
-            if await loc.count() == 0:
-                return ""
-            return (await loc.inner_text()).strip()
-        except Exception:
-            return ""
-
-    @staticmethod
-    async def _child_exists(parent, selector: str) -> bool:
-        try:
-            return await parent.locator(selector).count() > 0
-        except Exception:
-            return False
-
-    @staticmethod
-    async def _attr(locator, name: str) -> str | None:
-        try:
-            return await locator.get_attribute(name)
-        except Exception:
-            return None
-
-
-__all__ = ["TableScraper", "parse_amount", "parse_card"]
+__all__ = ["TableScraper", "parse_amount", "parse_card", "parse_card_from_src"]
