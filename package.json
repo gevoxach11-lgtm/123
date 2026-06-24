@@ -1,0 +1,28 @@
+{
+  "name": "poker-coach",
+  "version": "0.1.0",
+  "description": "A desktop browser-based poker learning assistant. Opens your poker site, watches only your hole cards, and explains hand strength, equity, and strategy to help you learn.",
+  "main": "src/main/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "lint": "echo 'no linter configured' && exit 0"
+  },
+  "keywords": [
+    "poker",
+    "electron",
+    "coach",
+    "learning",
+    "ocr"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.0.0"
+  },
+  "dependencies": {
+    "pokersolver": "^2.1.4",
+    "tesseract.js": "^5.1.0"
+  }
+}
