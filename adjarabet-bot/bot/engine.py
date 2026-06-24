@@ -62,7 +62,6 @@ class PokerEngine:
 
         cards = state.my_cards
         facing_bet = state.call_amount > 0
-        bb = state.big_blind or 0.10
 
         is_premium = ranges.is_three_bet(cards)
         in_open = ranges.in_opening_range(cards, state.position)

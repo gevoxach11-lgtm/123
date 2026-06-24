@@ -166,8 +166,6 @@ class SessionManager:
             self._last_stack = state.my_stack
 
     def _record(self, state: GameState, action: Action) -> None:
-        if action.type.value in ("bet", "raise", "call"):
-            self.stats.vpip_count += 0  # incremented per-hand below if desired
         self.history.append(
             DecisionRecord(
                 timestamp=time.time(),
