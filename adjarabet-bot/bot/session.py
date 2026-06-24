@@ -113,7 +113,7 @@ class SessionManager:
     async def play_loop(self, page) -> None:
         """Poll the table and act when it's hero's turn."""
         scraper = TableScraper(page, config)
-        engine = PokerEngine()
+        engine = PokerEngine(config)
         executor = ActionExecutor(page, dry_run=self.cfg.dry_run or not self.cfg.auto_play)
 
         poll = config.TIMING["POLL_INTERVAL"]

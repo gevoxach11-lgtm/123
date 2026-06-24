@@ -1,209 +1,286 @@
-"""Poker decision engine.
+"""Poker decision-making engine.
 
-Turns a :class:`GameState` into an :class:`Action`. The strategy combines:
+Turns a :class:`GameState` into an :class:`Action`:
 
-* Preflop: position-aware GTO-ish opening ranges (:mod:`poker.ranges`).
-* Postflop: Monte-Carlo equity (:mod:`poker.montecarlo`) compared against pot
-  odds, with simple value-betting and bluff-control heuristics.
+* **Preflop** - position-aware open / 3-bet / 4-bet logic driven by the GTO
+  range tables in :mod:`poker.ranges`.
+* **Postflop** - Monte-Carlo equity (:mod:`poker.montecarlo`) compared with pot
+  odds, combined with made-hand strength and draw detection.
 
-The logic is deliberately transparent and conservative - it is a solid baseline
-"TAG" (tight-aggressive) strategy, not a solver. Every decision carries a
-``reason`` string for auditability in the logs and dashboard.
+The strategy is a solid, transparent tight-aggressive baseline (not a solver).
+Bet sizes carry small random variation and the engine occasionally bluffs or
+slow-plays so its behaviour is less predictable. Every decision records a
+``reason`` for the logs / dashboard, and the final action is "legalised"
+against the actions the table actually offers.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import random
 
-from poker.models import Action, ActionType, GameState, Street
-from poker import ranges
-from poker.montecarlo import estimate_equity
+from poker.evaluator import evaluate_hand, hand_key
+from poker.montecarlo import (
+    has_flush_draw,
+    has_straight_draw,
+    monte_carlo_equity,
+    pot_odds,
+)
+from poker.ranges import (
+    FOUR_BET_RANGE,
+    OPEN_RANGES,
+    THREE_BET_RANGES,
+    is_in_range,
+)
+from poker.models import Action, ActionType, GameState, Position, Street
 from utils.logger import get_logger
 
 logger = get_logger()
+
+# Map the rich Position enum onto the five range buckets used by the tables.
+_POSITION_BUCKET = {
+    Position.UTG: "UTG",
+    Position.UTG1: "UTG",
+    Position.MP: "MP",
+    Position.LJ: "MP",
+    Position.HJ: "CO",
+    Position.CO: "CO",
+    Position.BTN: "BTN",
+    Position.SB: "SB",
+    Position.BB: "BTN",       # BB defends wide; reuse the widest set.
+    Position.UNKNOWN: "MP",
+}
+
+# Cold-calling range vs a 3-bet (premiums only).
+_COLD_CALL_VS_3BET = {"JJ", "TT", "AKs", "AKo", "QQ"}
+
+# Postflop equity simulation depth (5000 sims run in well under a second).
+_POSTFLOP_SIMS = 4000
 
 
 class PokerEngine:
     """Compute the bot's action for a given game state."""
 
-    def __init__(
-        self,
-        mc_iterations: int = 3000,
-        aggression: float = 1.0,
-        rng: random.Random | None = None,
-    ) -> None:
-        self.mc_iterations = mc_iterations
-        self.aggression = aggression
+    def __init__(self, config=None, rng: random.Random | None = None) -> None:
+        self.config = config
         self.rng = rng or random.Random()
 
     # ------------------------------------------------------------------ #
-    # Public API
+    # Routing
     # ------------------------------------------------------------------ #
     def decide(self, state: GameState) -> Action:
-        """Return the engine's chosen action for the current state."""
-        if not state.is_my_turn or not state.available_actions:
-            return Action(ActionType.CHECK, reason="not my turn")
+        """Route to the preflop or postflop engine and return a legal action."""
+        if len(state.my_cards) < 2:
+            return self._legalize(self._passive(state, "no hole cards"), state)
 
         if state.round == Street.PREFLOP:
-            action = self._decide_preflop(state)
+            action = self.preflop_decide(state)
         else:
-            action = self._decide_postflop(state)
+            action = self.postflop_decide(state)
 
-        action = self._validate(action, state)
+        action = self._legalize(action, state)
         logger.info("Decision: {} | {}", action, state)
         return action
 
     # ------------------------------------------------------------------ #
     # Preflop
     # ------------------------------------------------------------------ #
-    def _decide_preflop(self, state: GameState) -> Action:
-        if len(state.my_cards) < 2:
-            return self._safe_passive(state, "no hole cards read")
+    def preflop_decide(self, state: GameState) -> Action:
+        c1, c2 = state.my_cards[0], state.my_cards[1]
+        pos = state.position
+        call_amount = state.call_amount
+        stack = state.my_stack
 
-        cards = state.my_cards
-        facing_bet = state.call_amount > 0
+        bucket = _POSITION_BUCKET.get(pos, "MP")
+        open_range = OPEN_RANGES.get(bucket, OPEN_RANGES["MP"])
+        three_bet_range = THREE_BET_RANGES.get(bucket, THREE_BET_RANGES["default"])
 
-        is_premium = ranges.is_three_bet(cards)
-        in_open = ranges.in_opening_range(cards, state.position)
-        can_call = ranges.in_calling_range(cards)
-        strength = ranges.hand_strength_score(cards)
+        # Big blind estimate: prefer the real value, fall back to the spec rule.
+        bb = state.big_blind if getattr(state, "big_blind", 0) else 0.0
+        if bb <= 0:
+            bb = max(0.02 * stack, 1.0)
 
-        if not facing_bet:
-            # Unopened pot - open-raise in range, else check/fold.
-            if in_open:
-                size = self._raise_size(state, base_bb=3.0)
-                return Action(ActionType.RAISE, size, confidence=strength,
-                              reason=f"open-raise {ranges.hand_notation(cards)} from {state.position.value}")
-            if state.can(ActionType.CHECK):
-                return Action(ActionType.CHECK, reason="check option in BB")
-            return Action(ActionType.FOLD, reason="out of opening range")
+        key = hand_key(c1, c2)
 
-        # Facing a bet/raise.
-        if is_premium:
-            size = self._raise_size(state, base_bb=9.0)
-            return Action(ActionType.RAISE, size, confidence=0.9,
-                          reason=f"3-bet for value {ranges.hand_notation(cards)}")
+        # --- Unopened pot (no meaningful bet to call) ---
+        if call_amount == 0 or call_amount <= bb:
+            if is_in_range(c1, c2, open_range):
+                mult = 2.5 if bucket in ("BTN", "CO") else 3.0
+                size = self._vary(mult * bb, 0.15)
+                return self._raise(state, size, confidence=0.7,
+                                   reason=f"open-raise {key} from {bucket} ({mult}bb)")
+            # Not in opening range.
+            if pos == Position.BB and call_amount <= bb:
+                if self._chance(0.08):
+                    size = self._vary(2.5 * bb, 0.15)
+                    return self._raise(state, size, confidence=0.2,
+                                       reason=f"bluff open {key} from BB")
+                return Action(ActionType.CHECK, reason=f"check BB with {key}")
+            if self._chance(0.08):
+                size = self._vary((2.5 if bucket in ("BTN", "CO") else 3.0) * bb, 0.15)
+                return self._raise(state, size, confidence=0.2,
+                                   reason=f"bluff open {key} from {bucket}")
+            return Action(ActionType.FOLD, reason=f"fold {key} (out of range)")
 
-        if in_open or can_call:
-            # Reasonable hand - call if price is right.
-            if self._price_ok(state, required_equity=0.35):
-                return Action(ActionType.CALL, state.call_amount, confidence=strength,
-                              reason=f"call {ranges.hand_notation(cards)} (price ok)")
-        return Action(ActionType.FOLD, reason=f"fold {ranges.hand_notation(cards)} preflop")
+        # --- Facing a single raise ---
+        if bb < call_amount < 8 * bb:
+            if is_in_range(c1, c2, three_bet_range):
+                size = self._vary(call_amount * 3.0, 0.10)
+                return self._raise(state, size, confidence=0.85,
+                                   reason=f"3-bet for value {key}")
+            if is_in_range(c1, c2, open_range):
+                return Action(ActionType.CALL, call_amount, confidence=0.5,
+                              reason=f"call raise with {key}")
+            return Action(ActionType.FOLD, reason=f"fold {key} vs raise")
+
+        # --- Facing a 3-bet or larger ---
+        if is_in_range(c1, c2, FOUR_BET_RANGE):
+            size = self._vary(call_amount * 2.5, 0.10)
+            return self._raise(state, size, confidence=0.95,
+                               reason=f"4-bet for value {key}")
+        if key in _COLD_CALL_VS_3BET:
+            return Action(ActionType.CALL, call_amount, confidence=0.7,
+                          reason=f"cold-call 3-bet with {key}")
+        return Action(ActionType.FOLD, reason=f"fold {key} vs 3-bet")
 
     # ------------------------------------------------------------------ #
     # Postflop
     # ------------------------------------------------------------------ #
-    def _decide_postflop(self, state: GameState) -> Action:
-        if len(state.my_cards) < 2:
-            return self._safe_passive(state, "no hole cards read")
+    def postflop_decide(self, state: GameState) -> Action:
+        c1, c2 = state.my_cards[0], state.my_cards[1]
+        community = state.community_cards
+        pot = state.pot
+        call_amount = state.call_amount
 
-        opponents = max(1, state.num_active - 1)
-        result = estimate_equity(
-            state.my_cards,
-            state.community_cards,
-            num_opponents=opponents,
-            iterations=self.mc_iterations,
-            rng=self.rng,
+        equity = monte_carlo_equity(
+            [c1, c2], community, villain_count=1, n_sims=_POSTFLOP_SIMS, rng=self.rng
         )
-        equity = result.equity
-        facing_bet = state.call_amount > 0
-        pot_odds = state.pot_odds
+        p_odds = pot_odds(call_amount, pot) if call_amount > 0 else 0.0
+        hand = evaluate_hand([c1, c2] + list(community)) if community else None
+        category = hand["category"] if hand else 1
+
+        # Category buckets: strong = straight+, medium = trips/two-pair.
+        strong = category >= 5
+        medium = category in (3, 4)
+
+        flush_draw = has_flush_draw([c1, c2], community)
+        straight_draw = has_straight_draw([c1, c2], community)
+        is_draw = flush_draw or straight_draw
 
         logger.debug(
-            "Postflop equity={:.3f} potOdds={:.3f} opp={} street={}",
-            equity, pot_odds, opponents, state.round.value,
+            "Postflop eq={:.3f} odds={:.3f} cat={} strong={} medium={} draw={}",
+            equity, p_odds, category, strong, medium, is_draw,
         )
 
-        # Strong hand -> bet/raise for value.
-        value_threshold = 0.66
-        bluff_threshold = 0.30
-
-        if not facing_bet:
-            if equity >= value_threshold and state.can(ActionType.BET):
-                size = self._bet_size(state, fraction=0.66)
-                return Action(ActionType.BET, size, confidence=equity,
-                              reason=f"value bet (eq {equity:.0%})")
-            # Semi-bluff occasionally with low-equity hands when it's cheap.
-            if equity < bluff_threshold and state.can(ActionType.BET) and self._bluff_now(0.20):
-                size = self._bet_size(state, fraction=0.5)
-                return Action(ActionType.BET, size, confidence=0.2,
-                              reason=f"semi-bluff (eq {equity:.0%})")
-            if state.can(ActionType.CHECK):
+        # --- No bet facing us ---
+        if call_amount == 0:
+            # Occasional slow-play with a strong hand for deception.
+            if strong and self._chance(0.05):
                 return Action(ActionType.CHECK, confidence=equity,
-                              reason=f"check (eq {equity:.0%})")
-            return self._safe_passive(state, "no check available")
+                              reason=f"slow-play strong hand (eq {equity:.0%})")
 
-        # Facing a bet: compare equity to pot odds.
-        if equity >= value_threshold and state.can(ActionType.RAISE):
-            size = self._raise_size(state, base_bb=0.0, fraction=0.75)
-            return Action(ActionType.RAISE, size, confidence=equity,
-                          reason=f"raise for value (eq {equity:.0%})")
+            if equity > 0.70 and strong:
+                return self._bet(state, pot * 0.75, confidence=equity,
+                                 reason=f"value bet 75% (eq {equity:.0%})")
+            if equity > 0.60:
+                return self._bet(state, pot * 0.60, confidence=equity,
+                                 reason=f"value bet 60% (eq {equity:.0%})")
+            if equity > 0.50 and medium:
+                return self._bet(state, pot * 0.50, confidence=equity,
+                                 reason=f"bet 50% medium (eq {equity:.0%})")
+            if is_draw and equity > 0.35 and self._chance(0.40):
+                return self._bet(state, pot * 0.55, confidence=equity,
+                                 reason=f"semi-bluff 55% (eq {equity:.0%})")
+            return Action(ActionType.CHECK, confidence=equity,
+                          reason=f"check (eq {equity:.0%})")
 
-        if equity >= pot_odds + 0.02:  # small margin to cover rake/variance
-            return Action(ActionType.CALL, state.call_amount, confidence=equity,
-                          reason=f"call (eq {equity:.0%} > odds {pot_odds:.0%})")
-
-        if state.can(ActionType.CHECK):
-            return Action(ActionType.CHECK, confidence=equity, reason="check back")
-        return Action(ActionType.FOLD, confidence=1 - equity,
-                      reason=f"fold (eq {equity:.0%} < odds {pot_odds:.0%})")
+        # --- Facing a bet ---
+        if equity > p_odds * 1.4 and (strong or medium):
+            return self._raise(state, call_amount * 2.2, confidence=equity,
+                               reason=f"raise for value 2.2x (eq {equity:.0%})")
+        if equity > p_odds * 1.1:
+            return Action(ActionType.CALL, call_amount, confidence=equity,
+                          reason=f"call (eq {equity:.0%} > odds {p_odds:.0%})")
+        if is_draw and equity > p_odds * 0.9:
+            return Action(ActionType.CALL, call_amount, confidence=equity,
+                          reason=f"call draw (eq {equity:.0%})")
+        if equity < p_odds * 0.75:
+            return Action(ActionType.FOLD, confidence=1 - equity,
+                          reason=f"fold (eq {equity:.0%} << odds {p_odds:.0%})")
+        # Marginal spot: small bluff-raise frequency, otherwise fold.
+        if self._chance(0.08):
+            return self._raise(state, call_amount * 2.2, confidence=0.15,
+                               reason="bluff raise (marginal)")
+        return Action(ActionType.FOLD, reason=f"fold marginal (eq {equity:.0%})")
 
     # ------------------------------------------------------------------ #
-    # Sizing helpers
+    # Action builders
     # ------------------------------------------------------------------ #
-    def _raise_size(self, state: GameState, base_bb: float = 3.0, fraction: float = 0.0) -> float:
-        """Total raise size in chips."""
-        bb = state.big_blind or 0.10
-        if fraction > 0:
-            target = state.call_amount + (state.pot + state.call_amount) * fraction
-        else:
-            target = base_bb * bb + state.call_amount
-        target *= self.aggression
-        return self._clamp_bet(state, target)
+    def _raise(self, state: GameState, amount: float, confidence: float, reason: str) -> Action:
+        return Action(ActionType.RAISE, self._clamp(state, amount), confidence, reason)
 
-    def _bet_size(self, state: GameState, fraction: float = 0.66) -> float:
-        target = max(state.big_blind, state.pot * fraction) * self.aggression
-        return self._clamp_bet(state, target)
+    def _bet(self, state: GameState, amount: float, confidence: float, reason: str) -> Action:
+        amount = self._vary(amount, 0.10)
+        return Action(ActionType.BET, self._clamp(state, amount), confidence, reason)
 
-    def _clamp_bet(self, state: GameState, amount: float) -> float:
-        """Never bet more than the stack; round to a sensible precision."""
-        amount = max(state.big_blind, amount)
-        amount = min(amount, state.my_stack) if state.my_stack > 0 else amount
+    def _clamp(self, state: GameState, amount: float) -> float:
+        floor = state.big_blind if getattr(state, "big_blind", 0) else 0.0
+        amount = max(amount, floor)
+        if state.my_stack > 0:
+            amount = min(amount, state.my_stack)
         return round(amount, 2)
 
-    # ------------------------------------------------------------------ #
-    # Misc helpers
-    # ------------------------------------------------------------------ #
-    def _price_ok(self, state: GameState, required_equity: float) -> bool:
-        """Quick pot-odds gate for preflop calls."""
-        if state.call_amount <= 0:
-            return True
-        return state.pot_odds <= required_equity
+    def _vary(self, amount: float, pct: float) -> float:
+        return max(0.0, amount * (1 + self.rng.uniform(-pct, pct)))
 
-    def _bluff_now(self, probability: float) -> bool:
+    def _chance(self, probability: float) -> bool:
         return self.rng.random() < probability
 
-    def _safe_passive(self, state: GameState, reason: str) -> Action:
+    # ------------------------------------------------------------------ #
+    # Safety / legalisation
+    # ------------------------------------------------------------------ #
+    def _passive(self, state: GameState, reason: str) -> Action:
         if state.can(ActionType.CHECK):
             return Action(ActionType.CHECK, reason=reason)
         return Action(ActionType.FOLD, reason=reason)
 
-    def _validate(self, action: Action, state: GameState) -> Action:
-        """Ensure the chosen action is actually available; degrade if not."""
-        if state.can(action.type):
+    def _legalize(self, action: Action, state: GameState) -> Action:
+        """Map a decision onto an action the table actually offers."""
+        avail = state.available_actions
+        if not avail or action.type in avail:
             return action
-        # Map unavailable actions to the safest legal alternative.
-        if action.type == ActionType.RAISE and state.can(ActionType.BET):
-            return Action(ActionType.BET, action.amount, action.confidence,
-                          reason=action.reason + " (raise->bet)")
-        if action.type == ActionType.BET and state.can(ActionType.RAISE):
-            return Action(ActionType.RAISE, action.amount, action.confidence,
-                          reason=action.reason + " (bet->raise)")
-        if action.type in (ActionType.BET, ActionType.RAISE) and state.can(ActionType.CALL):
-            return Action(ActionType.CALL, state.call_amount, action.confidence,
-                          reason=action.reason + " (aggr->call)")
-        return self._safe_passive(state, action.reason + " (fallback)")
+
+        t = action.type
+        replace = dataclasses.replace
+
+        # Aggressive action: swap BET<->RAISE, else downgrade to call/check/fold.
+        if t == ActionType.RAISE and ActionType.BET in avail:
+            return replace(action, type=ActionType.BET, reason=action.reason + " (raise->bet)")
+        if t == ActionType.BET and ActionType.RAISE in avail:
+            return replace(action, type=ActionType.RAISE, reason=action.reason + " (bet->raise)")
+        if t in (ActionType.BET, ActionType.RAISE):
+            if ActionType.CALL in avail and state.call_amount > 0:
+                return replace(action, type=ActionType.CALL, amount=state.call_amount,
+                               reason=action.reason + " (aggr->call)")
+            if ActionType.CHECK in avail:
+                return replace(action, type=ActionType.CHECK, reason=action.reason + " (aggr->check)")
+            return replace(action, type=ActionType.FOLD, reason=action.reason + " (aggr->fold)")
+
+        if t == ActionType.CHECK:
+            if ActionType.CALL in avail and state.call_amount == 0:
+                return replace(action, type=ActionType.CALL, reason=action.reason + " (check->call0)")
+            return replace(action, type=ActionType.FOLD, reason=action.reason + " (check->fold)")
+
+        if t == ActionType.CALL:
+            if ActionType.CHECK in avail and state.call_amount == 0:
+                return replace(action, type=ActionType.CHECK, reason=action.reason + " (call->check)")
+            return replace(action, type=ActionType.FOLD, reason=action.reason + " (call->fold)")
+
+        if t == ActionType.FOLD and ActionType.CHECK in avail:
+            # Never fold when checking is free.
+            return replace(action, type=ActionType.CHECK, reason=action.reason + " (fold->check)")
+
+        return action
 
 
 __all__ = ["PokerEngine"]
