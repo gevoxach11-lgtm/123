@@ -1,7 +1,7 @@
 """Browser-automation poker bot components."""
 
 from .browser import BrowserManager
-from .auth import Authenticator
+from .auth import AuthManager, Authenticator
 from .lobby import LobbyNavigator, TableInfo
 from .scraper import TableScraper
 from .engine import PokerEngine
@@ -10,6 +10,7 @@ from .session import DecisionRecord, SessionConfig, SessionManager
 
 __all__ = [
     "BrowserManager",
+    "AuthManager",
     "Authenticator",
     "LobbyNavigator",
     "TableInfo",

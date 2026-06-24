@@ -53,8 +53,8 @@ HEADLESS: bool = _get_bool("HEADLESS", False)
 AUTO_PLAY: bool = _get_bool("AUTO_PLAY", False)
 
 # Base site URLs (override via .env if Adjarabet changes domains).
-BASE_URL: str = _get_str("ADJARABET_BASE_URL", "https://adjarabet.com")
-POKER_URL: str = _get_str("ADJARABET_POKER_URL", "https://adjarabet.com/en/poker")
+BASE_URL: str = _get_str("ADJARABET_BASE_URL", "https://www.adjarabet.am")
+POKER_URL: str = _get_str("ADJARABET_POKER_URL", "https://www.adjarabet.am/en/poker")
 
 
 # --------------------------------------------------------------------------- #

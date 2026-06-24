@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 
 import config
-from bot.auth import Authenticator
+from bot.auth import AuthManager
 from bot.browser import BrowserManager
 from bot.engine import PokerEngine
 from bot.executor import ActionExecutor
@@ -64,7 +64,7 @@ class SessionManager:
     def __init__(self, cfg: SessionConfig | None = None) -> None:
         self.cfg = cfg or SessionConfig()
         self.stats = SessionStats(big_blind=config.big_blind_for(self.cfg.table_limit))
-        self.browser = BrowserManager(headless=self.cfg.headless)
+        self.browser = BrowserManager(config, headless=self.cfg.headless)
         self.running = False
         self._stop_requested = False
         self.last_state: GameState | None = None
@@ -85,9 +85,9 @@ class SessionManager:
         logger.info("=== Session starting (limit={}, auto_play={}) ===",
                     self.cfg.table_limit, self.cfg.auto_play)
         try:
-            page = await self.browser.start()
-            auth = Authenticator(page)
-            if not await auth.login():
+            page = await self.browser.launch()
+            auth = AuthManager(page, config)
+            if not await auth.ensure_logged_in():
                 self.error = "Login failed - check credentials/selectors"
                 logger.error(self.error)
                 return
@@ -106,7 +106,7 @@ class SessionManager:
             self.error = f"{type(exc).__name__}: {exc}"
             logger.exception("Session crashed: {}", exc)
         finally:
-            await self.browser.stop()
+            await self.browser.close()
             self.running = False
             logger.info("=== Session ended === {}", self.stats.as_dict())
 
