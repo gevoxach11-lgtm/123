@@ -2,7 +2,7 @@
 
 from .browser import BrowserManager
 from .auth import AuthManager, Authenticator
-from .lobby import LobbyNavigator, TableInfo
+from .lobby import LobbyManager, LobbyNavigator, TableInfo
 from .scraper import TableScraper
 from .engine import PokerEngine
 from .executor import ActionExecutor
@@ -12,6 +12,7 @@ __all__ = [
     "BrowserManager",
     "AuthManager",
     "Authenticator",
+    "LobbyManager",
     "LobbyNavigator",
     "TableInfo",
     "TableScraper",

@@ -47,6 +47,9 @@ def _get_str(name: str, default: str = "") -> str:
 # --------------------------------------------------------------------------- #
 ADJARABET_USERNAME: str = _get_str("ADJARABET_USERNAME")
 ADJARABET_PASSWORD: str = _get_str("ADJARABET_PASSWORD")
+# Short aliases (used by the dashboard UI).
+USERNAME: str = ADJARABET_USERNAME
+PASSWORD: str = ADJARABET_PASSWORD
 TABLE_LIMIT: str = _get_str("TABLE_LIMIT", "NL10")
 PROXY_SERVER: str = _get_str("PROXY_SERVER")
 HEADLESS: bool = _get_bool("HEADLESS", False)

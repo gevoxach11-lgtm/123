@@ -85,8 +85,22 @@ class LobbyNavigator:
         logger.warning("No table matched {}; defaulting to first table", limit)
         return tables[0]
 
-    async def join_table(self, table: TableInfo) -> bool:
-        """Join the given table and take an open seat."""
+    async def navigate_to_poker(self) -> bool:
+        """Alias for :meth:`open_poker` (spec-friendly name)."""
+        return await self.open_poker()
+
+    async def join_table(self, table: "TableInfo | str | None" = None) -> bool:
+        """Join a table and take an open seat.
+
+        ``table`` may be a :class:`TableInfo`, a stake-limit string (e.g.
+        ``"NL10"``) or ``None`` (uses the configured limit). Strings/None are
+        resolved to a concrete table via :meth:`pick_table`.
+        """
+        if not isinstance(table, TableInfo):
+            table = await self.pick_table(table if isinstance(table, str) else None)
+            if not table:
+                logger.warning("No table available to join")
+                return False
         logger.info("Joining table: {}", table.name)
         rows = self.page.locator(self.sel["table_row"])
         row = rows.nth(table.index)
@@ -128,4 +142,8 @@ class LobbyNavigator:
             return ""
 
 
-__all__ = ["LobbyNavigator", "TableInfo"]
+# Spec-friendly alias.
+LobbyManager = LobbyNavigator
+
+
+__all__ = ["LobbyNavigator", "LobbyManager", "TableInfo"]

@@ -1,15 +1,15 @@
-"""AdjaraPoker Bot - Streamlit dashboard.
+"""AdjaraPoker Bot - Streamlit control dashboard.
 
-Provides a control panel to start/stop the bot, live session statistics,
-profit charts, a decision history table, and a standalone equity calculator
-for ad-hoc analysis.
+Start/stop the bot, watch the live hand, the engine's decision (with an equity
+gauge), session statistics + P/L chart, and a scrolling log.
 
 Run with::
 
     streamlit run app.py
 
-The bot itself runs in a background thread with its own asyncio event loop so
-the Streamlit UI thread stays responsive.
+The bot runs in a background thread with its own asyncio event loop (managed by
+a cached :class:`SessionRunner`) so the Streamlit UI thread stays responsive and
+state survives reruns.
 """
 
 from __future__ import annotations
@@ -17,55 +17,74 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections import deque
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from loguru import logger
 
-import config
-from bot.session import SessionConfig, SessionManager, prepare_session
-from poker.models import Card
-from poker.montecarlo import estimate_equity
-from poker.evaluator import describe
+import config as cfg
+from bot.session import SessionConfig, prepare_session
+from poker.montecarlo import pot_odds
 from utils.logger import setup_logger
 
 setup_logger()
 
 st.set_page_config(
-    page_title="AdjaraPoker Bot",
-    page_icon="\u2660",
+    page_title="Adjarabet Poker Bot",
+    page_icon="\U0001F0CF",  # playing card
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# Action -> colour for the big decision text.
+ACTION_COLORS = {
+    "raise": "#21ba45",
+    "bet": "#21ba45",
+    "call": "#fbbd08",
+    "check": "#00b5ad",
+    "fold": "#db2828",
+}
+
 
 # --------------------------------------------------------------------------- #
-# Background session runner
+# Shared singletons (survive Streamlit reruns)
 # --------------------------------------------------------------------------- #
 class SessionRunner:
-    """Own the browser + :class:`SessionManager` in a dedicated thread/loop."""
+    """Own the browser + SessionManager in a dedicated thread/event loop."""
 
     def __init__(self) -> None:
-        self.manager: SessionManager | None = None
+        self.manager = None
         self.browser = None
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.error: str | None = None
         self.stop_requested = False
+        self.update_data: dict | None = None
+        self.pl_history: list[tuple[int, float]] = []
 
-    def start(self, cfg: SessionConfig) -> None:
-        if self.thread and self.thread.is_alive():
+    def _on_update(self, data: dict) -> None:
+        self.update_data = data
+        stats = data.get("stats")
+        if stats is not None:
+            self.pl_history.append((stats.hands_played, round(stats.profit_loss, 2)))
+
+    def start(self, sconf: SessionConfig) -> None:
+        if self.is_running:
             return
         self.manager = None
         self.browser = None
         self.error = None
         self.stop_requested = False
+        self.update_data = None
+        self.pl_history = []
 
         def _run() -> None:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             try:
-                self.loop.run_until_complete(self._session(cfg))
+                self.loop.run_until_complete(self._session(sconf))
             except Exception as exc:  # pragma: no cover - surfaced in UI
                 self.error = f"{type(exc).__name__}: {exc}"
             finally:
@@ -74,10 +93,12 @@ class SessionRunner:
         self.thread = threading.Thread(target=_run, daemon=True, name="bot-session")
         self.thread.start()
 
-    async def _session(self, cfg: SessionConfig) -> None:
+    async def _session(self, sconf: SessionConfig) -> None:
         try:
-            self.manager, self.browser = await prepare_session(config, cfg)
-            if self.stop_requested:  # stop pressed during setup
+            self.manager, self.browser = await prepare_session(
+                cfg, sconf, on_state_update=self._on_update
+            )
+            if self.stop_requested:
                 return
             await self.manager.start()
         except Exception as exc:
@@ -103,238 +124,242 @@ class SessionRunner:
 
 @st.cache_resource
 def get_runner() -> SessionRunner:
-    """A single runner shared across Streamlit reruns."""
     return SessionRunner()
 
 
+@st.cache_resource
+def get_log_buffer() -> deque:
+    """A bounded log buffer fed by a loguru sink (registered once)."""
+    buffer: deque = deque(maxlen=200)
+    logger.add(
+        lambda message: buffer.append(message.record["time"].strftime("%H:%M:%S")
+                                      + f" | {message.record['level'].name:<7} | "
+                                      + message.record["message"]),
+        level="INFO",
+        enqueue=True,
+    )
+    return buffer
+
+
 runner = get_runner()
+log_buffer = get_log_buffer()
 
 
 # --------------------------------------------------------------------------- #
-# Sidebar - configuration & controls
+# Sidebar
 # --------------------------------------------------------------------------- #
-def render_sidebar() -> SessionConfig:
-    st.sidebar.title("\u2660 AdjaraPoker Bot")
-    st.sidebar.caption("Automated 6-max NLHE assistant")
+def render_sidebar() -> SessionConfig | None:
+    with st.sidebar:
+        st.title("\U0001F0CF Poker Bot")
+        st.divider()
 
-    st.sidebar.subheader("Session settings")
-    table_limit = st.sidebar.selectbox(
-        "Table limit",
-        options=list(config.LIMIT_BIG_BLINDS.keys()),
-        index=list(config.LIMIT_BIG_BLINDS.keys()).index(config.TABLE_LIMIT)
-        if config.TABLE_LIMIT in config.LIMIT_BIG_BLINDS else 2,
-    )
-    headless = st.sidebar.checkbox("Headless browser", value=config.HEADLESS)
-    auto_play = st.sidebar.checkbox(
-        "Auto-play (click buttons)", value=config.AUTO_PLAY,
-        help="When off, the bot analyses and logs decisions but does not click.",
-    )
-    dry_run = st.sidebar.checkbox(
-        "Dry run", value=not config.AUTO_PLAY,
-        help="Decide without executing any clicks (overrides auto-play).",
-    )
+        st.subheader("Account")
+        username = st.text_input("Username", value=cfg.USERNAME)
+        password = st.text_input("Password", type="password", value=cfg.PASSWORD)
 
-    st.sidebar.subheader("Safety limits")
-    max_hands = st.sidebar.number_input(
-        "Max hands", min_value=1, max_value=100000, value=config.SESSION["MAX_HANDS"], step=10)
-    max_minutes = st.sidebar.number_input(
-        "Max minutes", min_value=1, max_value=1440, value=config.SESSION["MAX_MINUTES"], step=5)
-    stop_loss = st.sidebar.number_input(
-        "Stop loss (bb)", min_value=1, max_value=100000, value=config.SESSION["STOP_LOSS"], step=10)
+        st.subheader("Table Settings")
+        limits = ["NL2", "NL5", "NL10", "NL25", "NL50"]
+        default_idx = limits.index(cfg.TABLE_LIMIT) if cfg.TABLE_LIMIT in limits else 2
+        table_limit = st.selectbox("Limit", limits, index=default_idx)
+        buyin_bb = st.slider("Buy-in (BB)", 40, 100, 100)
+        stop_loss = st.number_input("Stop Loss (\u20be)", value=50.0, min_value=1.0)
 
-    cfg = SessionConfig(
-        headless=headless,
-        auto_play=auto_play,
-        table_limit=table_limit,
-        max_hands=int(max_hands),
-        max_minutes=int(max_minutes),
-        stop_loss_bb=int(stop_loss),
-        dry_run=dry_run,
-    )
+        st.subheader("Bot Settings")
+        headless = st.checkbox("Headless Mode", value=cfg.HEADLESS)
+        auto_play = st.toggle("\U0001F916 Auto-Play", value=cfg.AUTO_PLAY)
+        proxy = st.text_input("SOCKS5 Proxy", value=cfg.PROXY_SERVER)
 
-    st.sidebar.subheader("Controls")
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("\u25b6 Start", use_container_width=True, disabled=runner.is_running):
-        runner.start(cfg)
-        st.sidebar.success("Session started")
-    if c2.button("\u23f9 Stop", use_container_width=True, disabled=not runner.is_running):
-        runner.stop()
-        st.sidebar.warning("Stopping...")
+        st.divider()
+        col1, col2 = st.columns(2)
+        start_btn = col1.button("\u25b6 Start", use_container_width=True, type="primary",
+                                disabled=runner.is_running)
+        stop_btn = col2.button("\u23f9 Stop", use_container_width=True,
+                               disabled=not runner.is_running)
 
-    auto_refresh = st.sidebar.checkbox("Auto-refresh (2s)", value=True)
-    st.session_state["_auto_refresh"] = auto_refresh
-
-    with st.sidebar.expander("Effective config"):
-        st.json(config.as_dict())
-
-    return cfg
-
-
-# --------------------------------------------------------------------------- #
-# Main dashboard
-# --------------------------------------------------------------------------- #
-def render_status() -> None:
-    st.header("Live session")
-    manager = runner.manager
-
-    if not manager:
-        if runner.error:
-            st.error(f"Could not start session: {runner.error}")
-        elif runner.is_running:
-            st.info("Connecting: launching browser, logging in and joining a table...")
-        else:
-            st.info("No session yet. Configure options in the sidebar and press **Start**.")
-        return
-
-    status = manager.status()
-
-    # Status banner.
-    if status["running"]:
-        st.success("Bot is running")
-    elif status["error"]:
-        st.error(f"Stopped: {status['error']}")
-    elif status["stop_reason"]:
-        st.warning(f"Stopped: {status['stop_reason']}")
-    else:
-        st.info("Idle")
-
-    stats = status["stats"]
-    table = status["table"]
-
-    # Key metrics.
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Hands", stats["hands_played"])
-    m2.metric("Win rate", f"{stats['win_rate'] * 100:.1f}%")
-    m3.metric("Profit", f"{stats['profit_loss']:+.2f}")
-    m4.metric("bb/100", f"{stats['bb_per_100']:+.1f}")
-    m5.metric("Elapsed", f"{stats['elapsed_minutes']:.1f} min")
-
-    # Current table view.
-    st.subheader("Table")
-    t1, t2 = st.columns(2)
-    with t1:
-        st.write(f"**Hand:** {table['hand_id'] or '-'}")
-        st.write(f"**Street:** {table['street'] or '-'}")
-        st.write(f"**My turn:** {'yes' if table['is_my_turn'] else 'no'}")
-    with t2:
-        st.write(f"**Pot:** {table['pot']:.2f}")
-        st.write(f"**My stack:** {table['my_stack']:.2f}")
-        hole = " ".join(table["my_cards"]) or "??"
-        board = " ".join(table["board"]) or "-"
-        st.write(f"**Hole:** {hole}  |  **Board:** {board}")
-
-    if status["last_action"]:
-        st.info(f"Last decision: {status['last_action']}")
-
-    # Profit chart from history (stack over time).
-    if manager.history:
-        df = pd.DataFrame(
-            [
-                {
-                    "time": time.strftime("%H:%M:%S", time.localtime(r.timestamp)),
-                    "stack": r.stack,
-                    "pot": r.pot,
-                    "hand_id": r.hand_id,
-                    "street": r.street,
-                    "action": r.action,
-                    "reason": r.reason,
-                }
-                for r in manager.history
-            ]
+    if start_btn and not runner.is_running:
+        # Apply UI overrides onto the config module the bot reads from.
+        cfg.ADJARABET_USERNAME = cfg.USERNAME = username
+        cfg.ADJARABET_PASSWORD = cfg.PASSWORD = password
+        cfg.PROXY_SERVER = proxy
+        cfg.TABLE_LIMIT = table_limit
+        bb = cfg.big_blind_for(table_limit) or 0.10
+        cfg.SESSION["STOP_LOSS"] = max(1, int(stop_loss / bb))
+        sconf = SessionConfig(
+            headless=headless,
+            auto_play=auto_play,
+            table_limit=table_limit,
+            stop_loss_bb=cfg.SESSION["STOP_LOSS"],
+            dry_run=not auto_play,
         )
-        st.subheader("Stack over time")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(y=df["stack"], mode="lines+markers", name="Stack"))
-        fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10),
-                          yaxis_title="Stack", xaxis_title="Decision #")
+        runner.start(sconf)
+        st.toast("Session starting...")
+
+    if stop_btn:
+        runner.stop()
+        st.toast("Stopping session...")
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot helpers
+# --------------------------------------------------------------------------- #
+def current_snapshot():
+    """Return (state, action, equity, stats) from the latest update/manager."""
+    data = runner.update_data
+    if data:
+        return data.get("state"), data.get("action"), data.get("equity"), data.get("stats")
+    manager = runner.manager
+    if manager:
+        return manager.last_state, manager.last_action, manager.last_equity, manager.stats
+    return None, None, None, None
+
+
+def status_label() -> str:
+    if runner.error:
+        return "\U0001F534 Error"
+    if runner.is_running and runner.manager and runner.manager.running:
+        return "\U0001F7E2 Running"
+    if runner.is_running:
+        return "\U0001F7E1 Connecting"
+    return "\U0001F534 Stopped"
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+def render_status_bar(stats, equity) -> None:
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Status", status_label())
+    s2.metric("Hands", stats.hands_played if stats else 0)
+    s3.metric("Profit", f"{stats.profit_loss:+.2f} \u20be" if stats else "0.00 \u20be")
+    s4.metric("bb/100", f"{stats.bb_per_100:+.1f}" if stats else "0.0")
+    s5.metric("Equity", f"{equity * 100:.1f}%" if equity is not None else "-")
+
+
+def render_live_game(state, action, equity) -> None:
+    col_game, col_decision = st.columns([2, 1])
+
+    with col_game:
+        st.subheader("Current Hand")
+        if state is None:
+            st.info("Waiting for a hand...")
+        else:
+            hole = "  ".join(str(c) for c in state.my_cards) or "?? ??"
+            board = "  ".join(str(c) for c in state.community_cards) or "-"
+            st.markdown(f"### Hole: `{hole}`")
+            st.markdown(f"**Board:** `{board}`  ·  **Street:** {state.round.value}")
+            st.markdown(
+                f"**Pot:** {state.pot:.2f} \u20be  ·  **My stack:** {state.my_stack:.2f} \u20be"
+                f"  ·  **To call:** {state.call_amount:.2f} \u20be"
+            )
+            if state.players:
+                df = pd.DataFrame(
+                    [
+                        {
+                            "Seat": p.seat,
+                            "Name": p.name or "?",
+                            "Stack": round(p.stack, 2),
+                            "Bet": round(p.bet, 2),
+                            "Active": p.is_active,
+                            "Hero": p.is_hero,
+                            "Dealer": p.is_dealer,
+                        }
+                        for p in state.players
+                    ]
+                )
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with col_decision:
+        st.subheader("Bot Decision")
+        # Equity gauge.
+        gauge_val = (equity or 0.0) * 100
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=gauge_val,
+            number={"suffix": "%"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#2185d0"},
+                "steps": [
+                    {"range": [0, 40], "color": "#3b1f24"},
+                    {"range": [40, 60], "color": "#3a371f"},
+                    {"range": [60, 100], "color": "#1f3a24"},
+                ],
+            },
+            title={"text": "Equity"},
+        ))
+        fig.update_layout(height=240, margin=dict(l=20, r=20, t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Decision history")
-        st.dataframe(df[::-1], use_container_width=True, height=320)
+        # Big colored action text.
+        if action is not None:
+            color = ACTION_COLORS.get(action.type.value, "#ffffff")
+            amount = f" {action.amount:.2f}\u20be" if action.amount else ""
+            st.markdown(
+                f"<div style='font-size:2.2rem;font-weight:800;color:{color};"
+                f"text-align:center;padding:10px 0'>{action.type.value.upper()}{amount}</div>",
+                unsafe_allow_html=True,
+            )
+            if action.reason:
+                st.caption(action.reason)
+        else:
+            st.markdown("<div style='text-align:center;color:#888'>No decision yet</div>",
+                        unsafe_allow_html=True)
+
+        # Pot odds.
+        if state is not None and state.call_amount > 0:
+            po = pot_odds(state.call_amount, state.pot)
+            st.metric("Pot odds", f"{po * 100:.1f}%")
+
+
+def render_stats(stats) -> None:
+    if not runner.pl_history:
+        st.caption("No hands recorded yet.")
     else:
-        st.caption("No decisions recorded yet.")
+        hands = [h for h, _ in runner.pl_history]
+        pls = [p for _, p in runner.pl_history]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=hands, y=pls, mode="lines+markers", name="P/L",
+                                 line=dict(color="#21ba45")))
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                          xaxis_title="Hand #", yaxis_title="Profit / Loss (\u20be)")
+        st.plotly_chart(fig, use_container_width=True)
 
-
-# --------------------------------------------------------------------------- #
-# Equity calculator tool
-# --------------------------------------------------------------------------- #
-def _parse_cards(text: str) -> list[Card]:
-    cards: list[Card] = []
-    for token in text.replace(",", " ").split():
-        cards.append(Card.from_str(token))
-    return cards
-
-
-def render_equity_tool() -> None:
-    st.header("Equity calculator")
-    st.caption("Estimate hero equity via Monte-Carlo simulation. "
-               "Enter cards like `Ah Kd`, board like `Qs Jc 2h`.")
-
-    c1, c2, c3 = st.columns(3)
-    hole_text = c1.text_input("Hole cards", value="Ah Kd")
-    board_text = c2.text_input("Board (0-5)", value="")
-    opponents = c3.number_input("Opponents", min_value=1, max_value=8, value=1)
-    iterations = st.slider("Iterations", 500, 20000, 5000, step=500)
-
-    if st.button("Calculate equity"):
-        try:
-            hole = _parse_cards(hole_text)
-            board = _parse_cards(board_text) if board_text.strip() else []
-            if len(hole) != 2:
-                st.error("Enter exactly two hole cards.")
-                return
-            with st.spinner("Simulating..."):
-                result = estimate_equity(
-                    hole, board, num_opponents=int(opponents), iterations=int(iterations)
-                )
-            e1, e2, e3, e4 = st.columns(4)
-            e1.metric("Equity", f"{result.equity * 100:.1f}%")
-            e2.metric("Win", f"{result.win * 100:.1f}%")
-            e3.metric("Tie", f"{result.tie * 100:.1f}%")
-            e4.metric("Lose", f"{result.lose * 100:.1f}%")
-            if board:
-                st.write(f"Current made hand: **{describe(hole + board)}**")
-        except Exception as exc:
-            st.error(f"Could not parse input: {exc}")
-
-
-# --------------------------------------------------------------------------- #
-# Layout
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    render_sidebar()
-    tab_live, tab_equity, tab_about = st.tabs(["Live session", "Equity tool", "About"])
-
-    with tab_live:
-        render_status()
-    with tab_equity:
-        render_equity_tool()
-    with tab_about:
-        st.markdown(
-            """
-            ### AdjaraPoker Bot
-
-            A Playwright-driven poker automation framework with a Streamlit
-            control panel.
-
-            **Components**
-            - `bot/` - browser, auth, lobby, scraper, engine, executor, session
-            - `poker/` - models, 7-card evaluator, Monte-Carlo equity, GTO ranges
-            - `utils/` - logging, stealth, human-like interaction
-
-            > **Disclaimer:** This project is for educational purposes. Automating
-            > play on real-money sites may violate their terms of service and/or
-            > local law. Use responsibly and at your own risk. The CSS selectors
-            > in `config.py` are placeholders and must be updated for the live
-            > client before any real use.
-            """
+    if stats is not None:
+        st.dataframe(
+            pd.DataFrame(stats.as_dict().items(), columns=["Metric", "Value"]),
+            use_container_width=True, hide_index=True,
         )
 
-    # Lightweight auto-refresh while running.
-    if st.session_state.get("_auto_refresh") and runner.is_running:
-        time.sleep(2)
-        st.rerun()
+
+def render_logs() -> None:
+    lines = list(log_buffer)[-100:]
+    st.code("\n".join(lines) if lines else "No logs yet.", language="log")
 
 
-if __name__ == "__main__":
-    main()
+# --------------------------------------------------------------------------- #
+# Page
+# --------------------------------------------------------------------------- #
+render_sidebar()
+
+state, action, equity, stats = current_snapshot()
+
+render_status_bar(stats, equity)
+if runner.error:
+    st.error(f"Session error: {runner.error}")
+
+st.divider()
+
+tab1, tab2, tab3 = st.tabs(["\U0001F4CA Live Game", "\U0001F4C8 Stats", "\U0001F4CB Logs"])
+with tab1:
+    render_live_game(state, action, equity)
+with tab2:
+    render_stats(stats)
+with tab3:
+    render_logs()
+
+# Live auto-refresh while the bot is running.
+if runner.is_running:
+    time.sleep(1.5)
+    st.rerun()
