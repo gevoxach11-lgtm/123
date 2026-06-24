@@ -6,7 +6,7 @@ from .lobby import LobbyManager, LobbyNavigator, TableInfo
 from .scraper import TableScraper
 from .engine import PokerEngine
 from .executor import ActionExecutor
-from .session import DecisionRecord, SessionConfig, SessionManager
+from .session import DecisionRecord, SessionConfig, SessionManager, prepare_session
 
 __all__ = [
     "BrowserManager",
@@ -21,4 +21,5 @@ __all__ = [
     "DecisionRecord",
     "SessionConfig",
     "SessionManager",
+    "prepare_session",
 ]

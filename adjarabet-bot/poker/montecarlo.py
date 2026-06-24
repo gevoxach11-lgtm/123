@@ -23,6 +23,9 @@ from typing import Iterable, Sequence
 
 from .evaluator import RANK_VALUES, best_score
 from .models import RANKS, SUITS, Card
+from utils.logger import get_logger
+
+logger = get_logger()
 
 
 # --------------------------------------------------------------------------- #
@@ -101,10 +104,24 @@ def monte_carlo_equity(
     """Estimate hero win equity in ``[0.0, 1.0]`` via Monte-Carlo simulation.
 
     Ties are split evenly: ``(wins + 0.5 * ties) / n_sims``.
+    Returns ``0.0`` on invalid input or simulation failure (never raises).
     """
-    rng = rng or random
-    wins, ties, _ = _run_sims(my_cards, community or [], villain_count, n_sims, rng)
-    return (wins + 0.5 * ties) / n_sims
+    try:
+        if not my_cards or len(my_cards) != 2:
+            logger.warning("monte_carlo_equity: need exactly 2 hole cards, got {}",
+                           len(my_cards or []))
+            return 0.0
+        if n_sims <= 0:
+            return 0.0
+        rng = rng or random
+        wins, ties, _ = _run_sims(my_cards, community or [], villain_count, n_sims, rng)
+        return (wins + 0.5 * ties) / n_sims
+    except ValueError as exc:
+        logger.warning("monte_carlo_equity invalid scenario: {}", exc)
+        return 0.0
+    except Exception as exc:  # pragma: no cover
+        logger.exception("monte_carlo_equity failed: {}", exc)
+        return 0.0
 
 
 # --------------------------------------------------------------------------- #

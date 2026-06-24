@@ -1,8 +1,7 @@
 """Adjarabet authentication flow.
 
 :class:`AuthManager` logs into the site using credentials from the supplied
-config, with human-like typing and resilient multi-selector lookups (the live
-markup is unknown, so several candidate selectors are tried for each element).
+config. All CSS selectors are read from :mod:`config` — never hardcoded here.
 """
 
 from __future__ import annotations
@@ -10,61 +9,11 @@ from __future__ import annotations
 import asyncio
 
 import config as _default_config
+from utils.errors import capture_page_error
 from utils.human import human_click, human_type, think_delay
 from utils.logger import get_logger
 
 logger = get_logger()
-
-# Candidate selectors - the first visible match wins.
-LOGIN_BUTTON_SELECTORS = [
-    'button:has-text("\u10e8\u10d4\u10e1\u10d5\u10da\u10d0")',  # "შესვლა" (log in)
-    '[data-testid="login"]',
-    '[class*="login" i] button',
-    'button:has-text("Login")',
-    'a:has-text("Login")',
-    'button:has-text("Sign in")',
-]
-
-USERNAME_SELECTORS = [
-    'input[name="username"]',
-    'input[name="email"]',
-    'input[name="login"]',
-    'input[autocomplete="username"]',
-    'input[type="text"]',
-    "#username",
-]
-
-PASSWORD_SELECTORS = [
-    'input[name="password"]',
-    'input[autocomplete="current-password"]',
-    'input[type="password"]',
-    "#password",
-]
-
-SUBMIT_SELECTORS = [
-    'button:has-text("\u10e8\u10d4\u10e1\u10d5\u10da\u10d0")',  # "შესვლა"
-    'button[type="submit"]',
-    '[data-testid="login-submit"]',
-    'button:has-text("Login")',
-    'button:has-text("Sign in")',
-]
-
-BALANCE_SELECTORS = [
-    ".balance",
-    '[class*="balance"]',
-    '[class*="user-name"]',
-    '[class*="profile"]',
-]
-
-ERROR_SELECTORS = [
-    '[class*="error"]',
-    '[role="alert"]',
-    ".error",
-    ".form-error",
-    '[class*="invalid"]',
-]
-
-LOGIN_TIMEOUT_SECONDS = 30.0
 
 
 class AuthManager:
@@ -77,17 +26,31 @@ class AuthManager:
     def _cfg(self, name: str, default=None):
         return getattr(self.config, name, default)
 
+    def _selectors(self, list_key: str) -> list[str]:
+        fn = getattr(self.config, "selector_list", None)
+        if callable(fn):
+            return fn(list_key)
+        sel = getattr(self.config, "SELECTORS", {}) or {}
+        return [sel.get(list_key, list_key)]
+
+    def _timing(self, key: str, default: float) -> float:
+        return (self._cfg("TIMING", {}) or {}).get(key, default)
+
     # ------------------------------------------------------------------ #
     # State checks
     # ------------------------------------------------------------------ #
     async def is_logged_in(self) -> bool:
         """Return True if a balance / profile element is visible."""
-        return await self._any_visible(BALANCE_SELECTORS, timeout_ms=1500)
+        try:
+            return await self._any_visible(self._selectors("logged_in_marker"), timeout_ms=1500)
+        except Exception as exc:
+            await capture_page_error(self.page, self.config, "auth_is_logged_in", exc)
+            return False
 
     async def _any_visible(self, selectors: list[str], timeout_ms: int = 1500) -> bool:
-        for selector in selectors:
+        for css in selectors:
             try:
-                locator = self.page.locator(selector).first
+                locator = self.page.locator(css).first
                 if await locator.count() == 0:
                     continue
                 await locator.wait_for(state="visible", timeout=timeout_ms)
@@ -96,10 +59,17 @@ class AuthManager:
                 continue
         return False
 
+    async def _detect_2fa(self) -> bool:
+        """Return True if a 2FA / OTP prompt appears to be visible."""
+        try:
+            return await self._any_visible(self._selectors("twofa_marker"), timeout_ms=800)
+        except Exception:
+            return False
+
     async def _error_text(self) -> str | None:
-        for selector in ERROR_SELECTORS:
+        for css in self._selectors("login_error"):
             try:
-                locator = self.page.locator(selector).first
+                locator = self.page.locator(css).first
                 if await locator.count() == 0:
                     continue
                 if await locator.is_visible():
@@ -113,18 +83,26 @@ class AuthManager:
     # ------------------------------------------------------------------ #
     # Actions
     # ------------------------------------------------------------------ #
-    async def _click_first(self, selectors: list[str], timeout: float = 5.0) -> bool:
-        for selector in selectors:
-            if await human_click(self.page, selector, timeout=timeout):
-                logger.debug("Clicked selector: {}", selector)
-                return True
+    async def _click_first(self, list_key: str, timeout: float | None = None) -> bool:
+        timeout = timeout if timeout is not None else self._timing("ACTION_TIMEOUT", 10.0)
+        for css in self._selectors(list_key):
+            try:
+                if await human_click(self.page, css, timeout=timeout):
+                    logger.debug("Clicked selector: {}", css)
+                    return True
+            except Exception as exc:
+                logger.debug("Click failed on {}: {}", css, exc)
         return False
 
-    async def _type_first(self, selectors: list[str], text: str, timeout: float = 5.0) -> bool:
-        for selector in selectors:
-            if await human_type(self.page, selector, text, timeout=timeout):
-                logger.debug("Typed into selector: {}", selector)
-                return True
+    async def _type_first(self, list_key: str, text: str, timeout: float | None = None) -> bool:
+        timeout = timeout if timeout is not None else self._timing("ACTION_TIMEOUT", 10.0)
+        for css in self._selectors(list_key):
+            try:
+                if await human_type(self.page, css, text, timeout=timeout):
+                    logger.debug("Typed into selector: {}", css)
+                    return True
+            except Exception as exc:
+                logger.debug("Type failed on {}: {}", css, exc)
         return False
 
     async def login(self) -> bool:
@@ -135,51 +113,69 @@ class AuthManager:
             logger.error("Missing credentials - set ADJARABET_USERNAME / ADJARABET_PASSWORD in .env")
             return False
 
-        base_url = self._cfg("BASE_URL", "https://www.adjarabet.am") or "https://www.adjarabet.am"
-        logger.info("Navigating to {} for login", base_url)
-        await self.page.goto(base_url, wait_until="domcontentloaded")
+        base_url = self._cfg("BASE_URL", "")
+        login_timeout = self._timing("LOGIN_TIMEOUT", 30.0)
+
+        try:
+            logger.info("Navigating to {} for login", base_url)
+            await self.page.goto(base_url, wait_until="domcontentloaded")
+        except Exception as exc:
+            await capture_page_error(self.page, self.config, "auth_goto", exc)
+            return False
+
         await think_delay()
 
         if await self.is_logged_in():
             logger.success("Already logged in")
             return True
 
-        # Open the login modal/form.
-        if not await self._click_first(LOGIN_BUTTON_SELECTORS):
-            logger.warning("Login button not found (selectors may need updating)")
-        await think_delay()
+        try:
+            if not await self._click_first("login_button"):
+                logger.warning("Login button not found (selectors may need updating)")
+            await think_delay()
 
-        # Fill credentials (typed character-by-character by human_type).
-        if not await self._type_first(USERNAME_SELECTORS, username):
-            logger.error("Username field not found")
-            return False
-        if not await self._type_first(PASSWORD_SELECTORS, password):
-            logger.error("Password field not found")
-            return False
-        await think_delay()
-
-        # Submit.
-        if not await self._click_first(SUBMIT_SELECTORS):
-            logger.warning("Submit button not found; pressing Enter")
-            try:
-                await self.page.keyboard.press("Enter")
-            except Exception:
-                pass
-
-        # Wait for balance (success) OR error, up to the timeout.
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + LOGIN_TIMEOUT_SECONDS
-        while loop.time() < deadline:
-            if await self.is_logged_in():
-                logger.success("Login successful")
-                return True
-            error = await self._error_text()
-            if error:
-                logger.error("Login error: {}", error)
+            if not await self._type_first("username_input", username):
+                logger.error("Username field not found")
+                await capture_page_error(self.page, self.config, "auth_no_username_field")
                 return False
-            await asyncio.sleep(0.5)
+            if not await self._type_first("password_input", password):
+                logger.error("Password field not found")
+                await capture_page_error(self.page, self.config, "auth_no_password_field")
+                return False
+            await think_delay()
 
-        logger.error("Login timed out after {}s", LOGIN_TIMEOUT_SECONDS)
+            if not await self._click_first("submit_login"):
+                logger.warning("Submit button not found; pressing Enter")
+                try:
+                    await self.page.keyboard.press("Enter")
+                except Exception:
+                    pass
+        except Exception as exc:
+            await capture_page_error(self.page, self.config, "auth_form", exc)
+            return False
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + login_timeout
+        while loop.time() < deadline:
+            try:
+                if await self.is_logged_in():
+                    logger.success("Login successful")
+                    return True
+                if await self._detect_2fa():
+                    logger.error("2FA prompt detected - manual login required")
+                    await capture_page_error(self.page, self.config, "auth_2fa_required")
+                    return False
+                error = await self._error_text()
+                if error:
+                    logger.error("Login error (wrong credentials?): {}", error)
+                    await capture_page_error(self.page, self.config, "auth_login_error")
+                    return False
+            except Exception as exc:
+                await capture_page_error(self.page, self.config, "auth_wait_loop", exc)
+            await asyncio.sleep(self._timing("TURN_WAIT_POLL", 0.5))
+
+        logger.error("Login timed out after {}s", login_timeout)
+        await capture_page_error(self.page, self.config, "auth_timeout")
         return False
 
     async def ensure_logged_in(self) -> bool:
@@ -190,8 +186,6 @@ class AuthManager:
         return await self.login()
 
 
-# Backward-compatible alias.
 Authenticator = AuthManager
-
 
 __all__ = ["AuthManager", "Authenticator"]

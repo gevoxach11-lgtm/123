@@ -28,6 +28,7 @@ from bot.lobby import LobbyNavigator
 from bot.scraper import TableScraper
 from poker.models import Action, GameState, SessionStats
 from poker.montecarlo import monte_carlo_equity
+from utils.errors import capture_page_error
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -116,6 +117,14 @@ class SessionManager:
     def poll_interval(self) -> float:
         return getattr(self.config, "TIMING", {}).get("POLL_INTERVAL", 0.4)
 
+    @property
+    def mc_display_sims(self) -> int:
+        return int((getattr(self.config, "MC", {}) or {}).get("SESSION_DISPLAY_SIMS", 3000))
+
+    async def _capture_error(self, label: str, exc: Exception) -> None:
+        page = getattr(self.scraper, "page", None)
+        await capture_page_error(page, self.config, label, exc)
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
@@ -131,7 +140,7 @@ class SessionManager:
             raise
         except Exception as exc:  # pragma: no cover - runtime safety net
             self.error = f"{type(exc).__name__}: {exc}"
-            logger.exception("Session crashed: {}", exc)
+            await self._capture_error("session_crash", exc)
         finally:
             self.running = False
             logger.info("Session ended ({}) | {}",
@@ -196,11 +205,15 @@ class SessionManager:
                 # --- Equity for display (postflop only) ---
                 equity = None
                 if len(state.community_cards) >= 3:
-                    villains = max(1, state.num_active - 1)
-                    equity = monte_carlo_equity(
-                        list(state.my_cards), list(state.community_cards),
-                        villain_count=villains, n_sims=3000,
-                    )
+                    try:
+                        villains = max(1, state.num_active - 1)
+                        equity = monte_carlo_equity(
+                            list(state.my_cards), list(state.community_cards),
+                            villain_count=villains, n_sims=self.mc_display_sims,
+                        )
+                    except Exception as exc:
+                        await self._capture_error("session_equity", exc)
+                        equity = None
                 self.last_equity = equity
                 self._record(state, action, equity)
 
@@ -235,7 +248,7 @@ class SessionManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover
-                logger.exception("Loop iteration error: {}", exc)
+                await self._capture_error("session_loop", exc)
                 await asyncio.sleep(poll)
 
         self.running = False
@@ -309,30 +322,32 @@ class SessionManager:
 # Orchestration: build a ready-to-run session (browser + auth + lobby + deps)
 # --------------------------------------------------------------------------- #
 async def prepare_session(config, cfg: SessionConfig, on_state_update=None):
-    """Launch the browser, log in, join a table and wire up a SessionManager.
-
-    Returns ``(manager, browser)``. Raises ``RuntimeError`` if login or seating
-    fails so the caller can surface the error and close the browser.
-    """
+    """Launch the browser, log in, join a table and wire up a SessionManager."""
     browser = BrowserManager(config, headless=cfg.headless)
-    page = await browser.launch()
+    page = None
+    try:
+        page = await browser.launch()
+        auth = AuthManager(page, config)
+        if not await auth.ensure_logged_in():
+            raise RuntimeError("Login failed - check credentials/selectors")
 
-    auth = AuthManager(page, config)
-    if not await auth.ensure_logged_in():
-        raise RuntimeError("Login failed - check credentials/selectors")
+        lobby = LobbyNavigator(page, config)
+        if not await lobby.find_and_join(cfg.table_limit):
+            raise RuntimeError("Could not join a table")
 
-    lobby = LobbyNavigator(page)
-    if not await lobby.find_and_join(cfg.table_limit):
-        raise RuntimeError("Could not join a table")
+        engine = PokerEngine(config)
+        scraper = TableScraper(page, config)
+        executor = ActionExecutor(page, config, dry_run=cfg.dry_run or not cfg.auto_play)
 
-    engine = PokerEngine(config)
-    scraper = TableScraper(page, config)
-    executor = ActionExecutor(page, config, dry_run=cfg.dry_run or not cfg.auto_play)
-
-    manager = SessionManager(config, engine, scraper, executor)
-    manager.auto_play = cfg.auto_play and not cfg.dry_run
-    manager.on_state_update = on_state_update
-    return manager, browser
+        manager = SessionManager(config, engine, scraper, executor)
+        manager.auto_play = cfg.auto_play and not cfg.dry_run
+        manager.on_state_update = on_state_update
+        return manager, browser
+    except Exception as exc:
+        if page is not None:
+            await capture_page_error(page, config, "prepare_session", exc)
+        await browser.close()
+        raise
 
 
 __all__ = ["SessionManager", "SessionConfig", "DecisionRecord", "prepare_session"]

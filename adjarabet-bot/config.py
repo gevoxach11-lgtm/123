@@ -95,9 +95,10 @@ SELECTORS: dict[str, str] = {
     "my_stack": ".hero .stack",
     "my_bet": ".hero .bet",
     "seat": ".seat",
-    "seat_name": ".seat .player-name",
-    "seat_stack": ".seat .stack",
-    "seat_bet": ".seat .bet",
+    "seat_name": '[class*="name" i]',
+    "seat_stack": '[class*="stack" i]',
+    "seat_chips": '[class*="chips" i]',
+    "seat_bet": '[class*="bet" i]',
     "seat_active": ".seat.active",
     "dealer_button": ".dealer-button",
     "turn_timer": ".hero .timer",
@@ -112,7 +113,112 @@ SELECTORS: dict[str, str] = {
     "bet_amount_input": "input.bet-amount",
     "bet_confirm_button": "button[data-action='confirm']",
     "bet_slider": "input.bet-slider",
+
+    # --- Fallback / generic scraper selectors (update for live client) ---
+    "card_generic": '[class*="card" i]',
+    "card_img": 'img[src*="card" i]',
+    "card_data": "[data-rank][data-suit]",
+    "hole_cards": '[class*="hole" i] [class*="card" i]',
+    "community_cards": '[class*="community" i] [class*="card" i]',
+    "board_cards": '[class*="board" i] [class*="card" i]',
+    "pot_generic": '[class*="pot" i]',
+    "total_generic": '[class*="total" i]',
+    "stack_generic": '[class*="stack" i]',
+    "chips_generic": '[class*="chips" i]',
+    "seat_generic": '[class*="seat" i]',
+    "player_generic": '[class*="player" i]',
+    "dealer_generic": '[class*="dealer" i]',
+    "table_fallback": '[class*="table" i]',
+    "poker_fallback": '[class*="poker" i]',
+    "hand_id_fallback": '[class*="hand-id" i]',
+    "hand_id_alt": '[class*="handid" i]',
+    "timer_fallback": '[class*="timer" i]',
+    "timer_alt": '[class*="time-left" i]',
+    "action_buttons": 'button, [role="button"], [class*="btn" i], [class*="action" i] button',
+    "bet_input_number": 'input[type="number"]',
+    "bet_input_text": 'input[type="text"]',
+    "bet_input_amount": '[class*="amount" i] input',
+    "bet_input_class": '[class*="bet-input" i]',
+    "bet_input_amount_class": 'input[class*="amount" i]',
+    "bet_input_bet_class": 'input[class*="bet" i]',
+    "balance_marker": ".balance",
+    "balance_generic": '[class*="balance"]',
+    "profile_generic": '[class*="profile"]',
+    "username_generic": '[class*="user-name"]',
+    "login_georgian": 'button:has-text("\u10e8\u10d4\u10e1\u10d5\u10da\u10d0")',
+    "login_class": '[class*="login" i] button',
+    "login_text": 'button:has-text("Login")',
+    "login_link": 'a:has-text("Login")',
+    "login_signin": 'button:has-text("Sign in")',
+    "username_email": 'input[name="email"]',
+    "username_login": 'input[name="login"]',
+    "username_autocomplete": 'input[autocomplete="username"]',
+    "username_text": 'input[type="text"]',
+    "username_id": "#username",
+    "password_autocomplete": 'input[autocomplete="current-password"]',
+    "password_type": 'input[type="password"]',
+    "password_id": "#password",
+    "submit_georgian": 'button:has-text("\u10e8\u10d4\u10e1\u10d5\u10da\u10d0")',
+    "submit_testid": '[data-testid="login-submit"]',
+    "submit_signin": 'button:has-text("Sign in")',
+    "error_generic": '[class*="error"]',
+    "error_alert": '[role="alert"]',
+    "error_class": ".error",
+    "error_form": ".form-error",
+    "error_invalid": '[class*="invalid"]',
+    "twofa_generic": '[class*="2fa" i], [class*="otp" i], [class*="verification" i]',
 }
+
+
+# Ordered fallback lists (first match wins). All bot modules must use these
+# via :func:`selector_list` rather than hardcoding CSS in bot/ files.
+SELECTOR_LISTS: dict[str, list[str]] = {
+    "login_button": [
+        "login_georgian", "login_button", "login_class", "login_text", "login_link", "login_signin",
+    ],
+    "username_input": [
+        "username_input", "username_email", "username_login", "username_autocomplete",
+        "username_text", "username_id",
+    ],
+    "password_input": [
+        "password_input", "password_autocomplete", "password_type", "password_id",
+    ],
+    "submit_login": [
+        "submit_georgian", "submit_login", "submit_testid", "login_text", "submit_signin",
+    ],
+    "logged_in_marker": [
+        "logged_in_marker", "balance_marker", "balance_generic", "username_generic", "profile_generic",
+    ],
+    "login_error": [
+        "error_generic", "error_alert", "error_class", "error_form", "error_invalid",
+    ],
+    "twofa_marker": ["twofa_generic"],
+    "table_present": ["table_container", "table_fallback", "poker_fallback"],
+    "hand_id": ["hand_id", "hand_id_fallback", "hand_id_alt"],
+    "turn_timer": ["turn_timer", "timer_fallback", "timer_alt"],
+    "community_card": ["community_cards", "board_cards", "community_card"],
+    "bet_amount_input": [
+        "bet_amount_input", "bet_input_number", "bet_input_text", "bet_input_amount",
+        "bet_input_class", "bet_input_amount_class", "bet_input_bet_class",
+    ],
+    "stack_display": ["my_stack", "stack_generic", "chips_generic", "seat_stack", "seat_chips"],
+    "pot_display": ["pot_size", "pot_generic", "total_generic"],
+    "seat": ["seat", "seat_generic", "player_generic"],
+}
+
+
+def selector_list(key: str) -> list[str]:
+    """Resolve a logical selector key to an ordered list of CSS strings."""
+    if key in SELECTOR_LISTS:
+        return [SELECTORS.get(k, k) for k in SELECTOR_LISTS[key]]
+    if key in SELECTORS:
+        return [SELECTORS[key]]
+    return []
+
+
+def selector(key: str) -> str:
+    """Return the primary CSS selector for ``key``."""
+    return SELECTORS.get(key, key)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +230,35 @@ TIMING: dict[str, float] = {
     "POLL_INTERVAL": 0.4,   # how often the scraper polls the table DOM
     "PAGE_TIMEOUT": 30.0,   # default Playwright navigation/selector timeout
     "ACTION_TIMEOUT": 10.0, # timeout when waiting for an action button
+    "LOGIN_TIMEOUT": 30.0,  # max seconds to wait for login success/failure
+    "BET_OPEN_DELAY_MIN": 0.4,
+    "BET_OPEN_DELAY_MAX": 0.6,
+    "BET_CONFIRM_DELAY": 0.3,
+    "TURN_WAIT_POLL": 0.5,  # wait_for_my_turn poll interval
+}
+
+
+# --------------------------------------------------------------------------- #
+# Viewport geometry (ratios / pixels for scraper fallbacks)
+# --------------------------------------------------------------------------- #
+GEOMETRY: dict[str, float] = {
+    "HERO_BOTTOM_RATIO": 0.6,
+    "HERO_CENTER_X_OFFSET": 300,
+    "HERO_SEAT_X_OFFSET": 350,
+    "BOARD_CENTER_Y_OFFSET": 200,
+    "POT_CENTER_X_OFFSET": 400,
+    "POT_CENTER_Y_OFFSET": 300,
+    "STACK_BOTTOM_RATIO": 0.5,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Monte Carlo simulation counts
+# --------------------------------------------------------------------------- #
+MC: dict[str, int] = {
+    "DEFAULT_SIMS": 5000,
+    "ENGINE_SIMS": 4000,
+    "SESSION_DISPLAY_SIMS": 3000,
 }
 
 

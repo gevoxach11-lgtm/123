@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import random
 
+import config as _default_config
 from poker.evaluator import evaluate_hand, hand_key
 from poker.montecarlo import (
     has_flush_draw,
@@ -54,16 +55,18 @@ _POSITION_BUCKET = {
 # Cold-calling range vs a 3-bet (premiums only).
 _COLD_CALL_VS_3BET = {"JJ", "TT", "AKs", "AKo", "QQ"}
 
-# Postflop equity simulation depth (5000 sims run in well under a second).
-_POSTFLOP_SIMS = 4000
+# Postflop equity simulation depth (from config.MC.ENGINE_SIMS).
 
 
 class PokerEngine:
     """Compute the bot's action for a given game state."""
 
     def __init__(self, config=None, rng: random.Random | None = None) -> None:
-        self.config = config
+        self.config = config or _default_config
         self.rng = rng or random.Random()
+        mc = getattr(self.config, "MC", {}) or {}
+        self.mc_iterations = int(mc.get("ENGINE_SIMS", 4000))
+        self.aggression = 1.0
 
     # ------------------------------------------------------------------ #
     # Routing
@@ -153,7 +156,7 @@ class PokerEngine:
         call_amount = state.call_amount
 
         equity = monte_carlo_equity(
-            [c1, c2], community, villain_count=1, n_sims=_POSTFLOP_SIMS, rng=self.rng
+            [c1, c2], community, villain_count=1, n_sims=self.mc_iterations, rng=self.rng
         )
         p_odds = pot_odds(call_amount, pot) if call_amount > 0 else 0.0
         hand = evaluate_hand([c1, c2] + list(community)) if community else None
