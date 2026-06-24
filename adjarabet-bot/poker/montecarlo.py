@@ -1,8 +1,18 @@
-"""Monte-Carlo equity calculator.
+"""Monte-Carlo equity calculator and draw detection.
 
-Estimates hero's probability of winning (and tying) a hand by simulating many
-random runouts and random opponent holdings. Used by the engine to make
-+EV decisions when an exact equity table is unavailable.
+Public API (as requested):
+
+* :func:`full_deck`          - the 52-card deck.
+* :func:`remove_cards`       - filter known cards out of a deck.
+* :func:`monte_carlo_equity` - hero win equity (0.0-1.0) by simulation.
+* :func:`pot_odds`           - call / (pot + call).
+* :func:`has_flush_draw`     - 4 cards of one suit.
+* :func:`has_straight_draw`  - 4 cards to an open-ended/gutshot straight.
+
+The simulator deals random runouts and villain hands, evaluates everyone with
+the integer scorer from :mod:`poker.evaluator`, and returns
+``(wins + 0.5 * ties) / n_sims``. It is tuned to complete 5000 single-villain
+simulations in well under a second.
 """
 
 from __future__ import annotations
@@ -11,27 +21,106 @@ import random
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-from .evaluator import evaluate
+from .evaluator import RANK_VALUES, best_score
 from .models import RANKS, SUITS, Card
 
 
+# --------------------------------------------------------------------------- #
+# Deck helpers
+# --------------------------------------------------------------------------- #
 def full_deck() -> list[Card]:
     """Return a fresh, ordered 52-card deck."""
     return [Card(rank=r, suit=s) for r in RANKS for s in SUITS]
 
 
+def remove_cards(deck: Iterable[Card], known_cards: Iterable[Card]) -> list[Card]:
+    """Return ``deck`` with every card in ``known_cards`` removed."""
+    known = set(known_cards)
+    return [card for card in deck if card not in known]
+
+
+# --------------------------------------------------------------------------- #
+# Core simulation
+# --------------------------------------------------------------------------- #
+def _run_sims(
+    my_cards: Sequence[Card],
+    community: Sequence[Card],
+    villain_count: int,
+    n_sims: int,
+    rng: random.Random,
+) -> tuple[int, int, int]:
+    """Run the simulation loop, returning (wins, ties, losses)."""
+    if len(my_cards) != 2:
+        raise ValueError("my_cards must contain exactly 2 cards")
+    if villain_count < 1:
+        raise ValueError("villain_count must be >= 1")
+
+    community = list(community)
+    deck = remove_cards(full_deck(), list(my_cards) + community)
+
+    board_needed = 5 - len(community)
+    draw_count = board_needed + 2 * villain_count
+    if draw_count > len(deck):
+        raise ValueError("Not enough cards left in the deck for this scenario")
+
+    hero_base = list(my_cards)
+    sample = rng.sample  # local binding for speed
+    score = best_score
+
+    wins = ties = losses = 0
+    for _ in range(n_sims):
+        drawn = sample(deck, draw_count)
+        board = community + drawn[:board_needed]
+        hero_score = score(hero_base + board)
+
+        best_villain = 0
+        idx = board_needed
+        for _ in range(villain_count):
+            villain_score = score(drawn[idx:idx + 2] + board)
+            idx += 2
+            if villain_score > best_villain:
+                best_villain = villain_score
+
+        if hero_score > best_villain:
+            wins += 1
+        elif hero_score == best_villain:
+            ties += 1
+        else:
+            losses += 1
+
+    return wins, ties, losses
+
+
+def monte_carlo_equity(
+    my_cards: list[Card],
+    community: list[Card] | None = None,
+    villain_count: int = 1,
+    n_sims: int = 5000,
+    rng: random.Random | None = None,
+) -> float:
+    """Estimate hero win equity in ``[0.0, 1.0]`` via Monte-Carlo simulation.
+
+    Ties are split evenly: ``(wins + 0.5 * ties) / n_sims``.
+    """
+    rng = rng or random
+    wins, ties, _ = _run_sims(my_cards, community or [], villain_count, n_sims, rng)
+    return (wins + 0.5 * ties) / n_sims
+
+
+# --------------------------------------------------------------------------- #
+# Rich result wrapper (kept for the engine / dashboard)
+# --------------------------------------------------------------------------- #
 @dataclass
 class EquityResult:
-    """Outcome of an equity simulation."""
+    """Outcome of an equity simulation with win/tie/lose breakdown."""
 
-    win: float        # probability hero has the strict best hand
-    tie: float        # probability hero ties for best
-    lose: float       # probability hero loses
+    win: float
+    tie: float
+    lose: float
     iterations: int
 
     @property
     def equity(self) -> float:
-        """Pot-share equity, splitting ties evenly (2-way approximation)."""
         return self.win + self.tie / 2.0
 
     def as_dict(self) -> dict:
@@ -51,65 +140,11 @@ def estimate_equity(
     iterations: int = 5000,
     rng: random.Random | None = None,
 ) -> EquityResult:
-    """Estimate hero equity via Monte-Carlo simulation.
-
-    Parameters
-    ----------
-    hole_cards:
-        Hero's two hole cards.
-    community_cards:
-        Cards already on the board (0-5). Missing board cards are dealt
-        randomly each iteration.
-    num_opponents:
-        Number of opposing players, each dealt two random cards.
-    iterations:
-        Number of simulated runouts. Higher == more accurate but slower.
-    rng:
-        Optional ``random.Random`` instance for deterministic testing.
-    """
-    if len(hole_cards) != 2:
-        raise ValueError("hole_cards must contain exactly 2 cards")
-    if num_opponents < 1:
-        raise ValueError("num_opponents must be >= 1")
-
+    """Detailed equity estimate returning an :class:`EquityResult`."""
     rng = rng or random.Random()
-    community = list(community_cards or [])
-
-    known = set(hole_cards) | set(community)
-    available = [c for c in full_deck() if c not in known]
-
-    board_needed = 5 - len(community)
-    cards_per_iter = board_needed + 2 * num_opponents
-
-    if cards_per_iter > len(available):
-        raise ValueError("Not enough cards left in the deck for this scenario")
-
-    wins = ties = losses = 0
-    hero_base = list(hole_cards)
-
-    for _ in range(iterations):
-        drawn = rng.sample(available, cards_per_iter)
-        idx = 0
-        sim_board = community + drawn[idx:idx + board_needed]
-        idx += board_needed
-
-        hero_score = evaluate(hero_base + sim_board)
-
-        best_opp_score = None
-        for _ in range(num_opponents):
-            opp_hole = drawn[idx:idx + 2]
-            idx += 2
-            opp_score = evaluate(opp_hole + sim_board)
-            if best_opp_score is None or opp_score > best_opp_score:
-                best_opp_score = opp_score
-
-        if hero_score > best_opp_score:
-            wins += 1
-        elif hero_score == best_opp_score:
-            ties += 1
-        else:
-            losses += 1
-
+    wins, ties, losses = _run_sims(
+        hole_cards, community_cards or [], num_opponents, iterations, rng
+    )
     total = float(iterations)
     return EquityResult(
         win=wins / total,
@@ -126,13 +161,63 @@ def equity_pct(
     iterations: int = 5000,
 ) -> float:
     """Convenience wrapper returning equity as a 0..100 percentage."""
-    result = estimate_equity(
-        hole_cards,
-        list(community_cards or []),
-        num_opponents=num_opponents,
-        iterations=iterations,
-    )
-    return result.equity * 100.0
+    return monte_carlo_equity(
+        list(hole_cards), list(community_cards or []),
+        villain_count=num_opponents, n_sims=iterations,
+    ) * 100.0
 
 
-__all__ = ["EquityResult", "estimate_equity", "equity_pct", "full_deck"]
+# --------------------------------------------------------------------------- #
+# Pot odds & draws
+# --------------------------------------------------------------------------- #
+def pot_odds(call_amount: float, pot: float) -> float:
+    """Return the pot odds for a call: ``call / (pot + call)`` (0 if nothing to call)."""
+    if call_amount <= 0:
+        return 0.0
+    return call_amount / (pot + call_amount)
+
+
+def has_flush_draw(
+    my_cards: Iterable[Card],
+    community: Iterable[Card] | None = None,
+) -> bool:
+    """Return True if hero holds exactly four cards of one suit (a flush draw)."""
+    cards = list(my_cards) + list(community or [])
+    counts: dict[str, int] = {}
+    for card in cards:
+        counts[card.suit] = counts.get(card.suit, 0) + 1
+    return any(count == 4 for count in counts.values())
+
+
+def has_straight_draw(
+    my_cards: Iterable[Card],
+    community: Iterable[Card] | None = None,
+) -> bool:
+    """Return True for an open-ended or gutshot straight draw.
+
+    A draw exists when some five-rank window contains exactly four of our
+    distinct ranks (one card short of a straight). The ace is considered for
+    both the broadway (T-A) and wheel (A-5) straights.
+    """
+    cards = list(my_cards) + list(community or [])
+    values = {RANK_VALUES[c.rank] for c in cards}
+    if 14 in values:
+        values.add(1)  # ace plays low for the wheel
+    for low in range(1, 11):  # windows A-5 .. T-A
+        window = set(range(low, low + 5))
+        if len(window & values) == 4:
+            return True
+    return False
+
+
+__all__ = [
+    "full_deck",
+    "remove_cards",
+    "monte_carlo_equity",
+    "pot_odds",
+    "has_flush_draw",
+    "has_straight_draw",
+    "EquityResult",
+    "estimate_equity",
+    "equity_pct",
+]

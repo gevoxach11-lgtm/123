@@ -1,148 +1,192 @@
-"""GTO-flavoured preflop range tables.
+"""GTO 6-max preflop range tables.
 
-This module encodes a simplified, position-aware opening/calling range for
-6-max No-Limit Hold'em. Ranges are expressed using the standard 169-combo
-notation:
+Public API (as requested):
 
-* Pocket pairs:        ``"AA"``, ``"KK"`` ... ``"22"``
-* Suited hands:        ``"AKs"``, ``"T9s"`` ...
-* Offsuit hands:       ``"AKo"``, ``"KQo"`` ...
+* ``OPEN_RANGES``       - opening (raise-first-in) ranges per position.
+* ``THREE_BET_RANGES``  - value 3-bet ranges per position (plus ``'default'``).
+* ``FOUR_BET_RANGE``    - the nutted 4-bet range.
+* :func:`is_in_range`   - membership test accepting two cards.
 
-The tables are intentionally compact and opinionated rather than a full solver
-output - they give the engine a sensible default preflop policy that can later
-be replaced with solver-derived ranges.
+Ranges use the standard 169-combo notation (``"AKs"``, ``"AKo"``, ``"22"``).
+Each later position inherits the earlier (tighter) ranges and adds more combos.
+
+Backward-compatible helpers used by the engine (:func:`hand_notation`,
+:func:`in_opening_range`, :func:`is_three_bet`, :func:`in_calling_range`,
+:func:`hand_strength_score`) are also provided.
 """
 
 from __future__ import annotations
 
 from typing import Iterable
 
-from .models import RANK_VALUES, Card, Position
+from .evaluator import RANK_VALUES, hand_key
+from .models import Card, Position
 
 # --------------------------------------------------------------------------- #
-# Hand notation helpers
-# --------------------------------------------------------------------------- #
-def hand_notation(cards: Iterable[Card]) -> str:
-    """Convert two hole cards into 169-combo notation (e.g. ``'AKs'``)."""
-    cards = list(cards)
-    if len(cards) != 2:
-        raise ValueError("hand_notation requires exactly two cards")
-    a, b = cards
-    # Higher rank first.
-    if a.value < b.value:
-        a, b = b, a
-    if a.rank == b.rank:
-        return f"{a.rank}{b.rank}"  # pair, e.g. "AA"
-    suffix = "s" if a.suit == b.suit else "o"
-    return f"{a.rank}{b.rank}{suffix}"
-
-
-# --------------------------------------------------------------------------- #
-# Opening (raise-first-in) ranges per position - 6-max.
-# Each set lists every combo that should open-raise from that seat.
-# Ranges widen as position improves (UTG tightest, BTN widest).
+# Opening ranges (6-max). Each widens as position improves.
 # --------------------------------------------------------------------------- #
 _UTG = {
     "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77",
-    "AKs", "AQs", "AJs", "ATs", "KQs", "KJs", "QJs", "JTs", "T9s",
-    "AKo", "AQo",
+    "AKs", "AQs", "AJs", "ATs", "A9s",
+    "AKo", "AQo", "KQs", "KJs", "QJs", "JTs", "T9s", "98s",
 }
 
 _MP = _UTG | {
-    "66", "55",
-    "A9s", "KTs", "QTs", "J9s", "T8s", "98s",
-    "AJo", "KQo",
+    "66", "55", "A8s", "A5s", "A4s", "KTs", "QTs", "J9s", "AJo",
 }
 
 _CO = _MP | {
-    "44", "33", "22",
-    "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s",
-    "K9s", "Q9s", "J8s", "T7s", "97s", "87s", "76s", "65s",
-    "ATo", "KJo", "QJo", "JTo",
+    "44", "33", "22", "A3s", "A2s", "K9s", "Q9s", "T8s",
+    "97s", "87s", "76s", "KJo", "QJo", "JTo", "ATo",
 }
 
 _BTN = _CO | {
-    "K8s", "K7s", "K6s", "K5s", "Q8s", "J7s", "T6s", "96s", "86s", "75s",
-    "64s", "54s", "53s", "43s",
-    "A9o", "A8o", "A7o", "A5o", "KTo", "K9o", "QTo", "Q9o", "J9o", "T9o", "98o",
+    "K8s", "Q8s", "J8s", "T7s", "86s", "75s", "65s", "54s",
+    "KTo", "QTo", "A9o", "A8o",
 }
 
-_SB = _CO | {
-    "A9o", "KTo", "QTo", "JTo",
-    "K8s", "Q8s", "J8s", "T8s",
+_SB = {
+    "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
+    "AKs", "AQs", "AJs", "ATs", "A9s", "A8s", "A5s",
+    "AKo", "AQo", "AJo", "KQs", "KJs", "KTs", "QJs", "JTs", "T9s", "98s",
 }
 
-OPENING_RANGES: dict[Position, set[str]] = {
-    Position.UTG: _UTG,
-    Position.UTG1: _UTG,
-    Position.MP: _MP,
-    Position.LJ: _MP,
-    Position.HJ: _CO,
-    Position.CO: _CO,
-    Position.BTN: _BTN,
-    Position.SB: _SB,
-    Position.BB: _BTN,  # BB defends very wide; reuse the widest open set.
-    Position.UNKNOWN: _MP,
+OPEN_RANGES: dict[str, set[str]] = {
+    "UTG": _UTG,
+    "MP": _MP,
+    "CO": _CO,
+    "BTN": _BTN,
+    "SB": _SB,
 }
 
-# Premium hands worth re-raising / 3-betting for value from any position.
-THREE_BET_VALUE = {"AA", "KK", "QQ", "JJ", "AKs", "AKo", "AQs"}
+THREE_BET_RANGES: dict[str, set[str]] = {
+    "BTN": {"AA", "KK", "QQ", "JJ", "AKs", "AQs", "AKo"},
+    "CO": {"AA", "KK", "QQ", "AKs", "AKo"},
+    "default": {"AA", "KK", "AKs"},
+}
 
-# Hands strong enough to call an open if not raising.
-CALLING_RANGE = _CO | {"A9o", "KJo", "QJo", "JTo", "T9o"}
+FOUR_BET_RANGE: set[str] = {"AA", "KK"}
+
+# Hands worth flat-calling an open when not 3-betting (roughly a CO open width).
+CALLING_RANGE: set[str] = _CO | {"A9o", "KJo", "QJo", "JTo", "T9o"}
+
+# Map the richer Position enum onto the five spec range buckets.
+_POSITION_TO_BUCKET: dict[Position, str] = {
+    Position.UTG: "UTG",
+    Position.UTG1: "UTG",
+    Position.MP: "MP",
+    Position.LJ: "MP",
+    Position.HJ: "CO",
+    Position.CO: "CO",
+    Position.BTN: "BTN",
+    Position.SB: "SB",
+    Position.BB: "BTN",       # BB defends very wide; reuse the widest set.
+    Position.UNKNOWN: "MP",
+}
 
 
 # --------------------------------------------------------------------------- #
-# Public API
+# Membership
 # --------------------------------------------------------------------------- #
+def is_in_range(c1: Card, c2: Card, range_set: Iterable[str]) -> bool:
+    """Return True if the two-card hand is in ``range_set``.
+
+    Matches both the full ``"AKs"`` / ``"AKo"`` / ``"22"`` notation and a
+    suit-agnostic ``"AK"`` / ``"22"`` form (which covers both suited and
+    offsuit combos).
+    """
+    members = range_set if isinstance(range_set, (set, frozenset)) else set(range_set)
+    key = hand_key(c1, c2)
+    if key in members:
+        return True
+    # Suit-agnostic form, e.g. "AK" matches AKs and AKo.
+    ranks_only = key[:2]
+    return ranks_only in members
+
+
+# --------------------------------------------------------------------------- #
+# Backward-compatible helpers (cards-as-list style)
+# --------------------------------------------------------------------------- #
+def hand_notation(cards: Iterable[Card]) -> str:
+    """Convert two hole cards into 169-combo notation (e.g. ``'AKs'``)."""
+    card_list = list(cards)
+    if len(card_list) != 2:
+        raise ValueError("hand_notation requires exactly two cards")
+    return hand_key(card_list[0], card_list[1])
+
+
+def _bucket_for(position: Position) -> str:
+    return _POSITION_TO_BUCKET.get(position, "MP")
+
+
 def in_opening_range(cards: Iterable[Card], position: Position) -> bool:
     """Return True if the hand should open-raise from the given position."""
-    return hand_notation(cards) in OPENING_RANGES.get(position, _MP)
+    card_list = list(cards)
+    if len(card_list) != 2:
+        return False
+    bucket = _bucket_for(position)
+    return is_in_range(card_list[0], card_list[1], OPEN_RANGES[bucket])
 
 
-def is_three_bet(cards: Iterable[Card]) -> bool:
-    """Return True for premium 3-bet-for-value hands."""
-    return hand_notation(cards) in THREE_BET_VALUE
+def is_three_bet(cards: Iterable[Card], position: Position | None = None) -> bool:
+    """Return True for value 3-bet hands (uses the position's range or default)."""
+    card_list = list(cards)
+    if len(card_list) != 2:
+        return False
+    if position is not None:
+        range_set = THREE_BET_RANGES.get(_bucket_for(position), THREE_BET_RANGES["default"])
+    else:
+        range_set = THREE_BET_RANGES["default"]
+    return is_in_range(card_list[0], card_list[1], range_set)
+
+
+def is_four_bet(cards: Iterable[Card]) -> bool:
+    """Return True for the nutted 4-bet range (AA, KK)."""
+    card_list = list(cards)
+    if len(card_list) != 2:
+        return False
+    return is_in_range(card_list[0], card_list[1], FOUR_BET_RANGE)
 
 
 def in_calling_range(cards: Iterable[Card]) -> bool:
     """Return True if the hand is strong enough to flat-call a raise."""
-    return hand_notation(cards) in CALLING_RANGE
+    card_list = list(cards)
+    if len(card_list) != 2:
+        return False
+    return is_in_range(card_list[0], card_list[1], CALLING_RANGE)
 
 
 def hand_strength_score(cards: Iterable[Card]) -> float:
-    """Rough 0..1 preflop strength heuristic (Chen-formula inspired).
-
-    Useful as a tiebreaker / sizing input when a hand is in range.
-    """
-    cards = list(cards)
-    a, b = (cards[0], cards[1]) if cards[0].value >= cards[1].value else (cards[1], cards[0])
-    high = a.value
-    # Base points from the high card (Chen formula style).
+    """Rough 0..1 preflop strength heuristic (Chen-formula inspired)."""
+    card_list = list(cards)
+    a, b = (card_list[0], card_list[1]) \
+        if RANK_VALUES[card_list[0].rank] >= RANK_VALUES[card_list[1].rank] \
+        else (card_list[1], card_list[0])
+    high = RANK_VALUES[a.rank]
     base = {14: 10, 13: 8, 12: 7, 11: 6}.get(high, high / 2.0)
     score = base
-    if a.rank == b.rank:  # pair
+    if a.rank == b.rank:
         score = max(base * 2, 5)
-    if a.suit == b.suit:  # suited bonus
+    if a.suit == b.suit:
         score += 2
-    gap = high - b.value
-    penalty = {0: 0, 1: 0, 2: 1, 3: 2, 4: 4}.get(gap, 5)
-    score -= penalty
-    # Straight bonus for connectors with low cards.
+    gap = high - RANK_VALUES[b.rank]
+    score -= {0: 0, 1: 0, 2: 1, 3: 2, 4: 4}.get(gap, 5)
     if gap <= 1 and high < 12:
         score += 1
-    # Normalise to ~0..1 (AA scores 20 in Chen).
     return max(0.0, min(1.0, score / 20.0))
 
 
 __all__ = [
-    "hand_notation",
-    "OPENING_RANGES",
-    "THREE_BET_VALUE",
+    "OPEN_RANGES",
+    "THREE_BET_RANGES",
+    "FOUR_BET_RANGE",
     "CALLING_RANGE",
+    "is_in_range",
+    "hand_key",
+    "hand_notation",
     "in_opening_range",
     "is_three_bet",
+    "is_four_bet",
     "in_calling_range",
     "hand_strength_score",
-    "RANK_VALUES",
 ]
